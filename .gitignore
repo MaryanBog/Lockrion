@@ -1,0 +1,13 @@
+lockrion.com/
+
+target/
+**/*.rs.bk
+**/*.log
+node_modules/
+.DS_Store
+.env
+*.key
+*.so
+*.dll
+*.dylib
+Cargo.lock
