@@ -1,13 +1,62 @@
 lockrion.com/
 
-target/
+# =========================
+# Rust / Cargo
+# =========================
+/target/
+/Cargo.lock
 **/*.rs.bk
-**/*.log
-node_modules/
+
+# =========================
+# Solana / Anchor / local ledgers
+# =========================
+/test-ledger/
+/solana-test-ledger/
+/docker-ledger;C/
+/ledger/
+/.ledger/
+/test-ledger-*/
+/validator-ledger/
+/localnet-ledger/
+/program-test-ledger/
+
+# Anchor common
+/.anchor/
+/Anchor.toml.bak
+
+# =========================
+# OS / Editor junk
+# =========================
 .DS_Store
-.env
-*.key
-*.so
-*.dll
-*.dylib
-Cargo.lock
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# JetBrains
+.idea/
+
+# Vim / Swap
+*.swp
+*.swo
+*~
+
+# =========================
+# Logs / temp
+# =========================
+*.log
+*.tmp
+*.temp
+
+# =========================
+# Windows/Git Bash oddities
+# (на случай если появятся)
+# =========================
+/C:/
+/C/

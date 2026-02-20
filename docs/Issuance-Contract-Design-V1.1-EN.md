@@ -244,35 +244,6 @@ Postconditions:
 
 ---
 
-### 3.3 deposit(amount)
-
-Purpose:
-Lock lock_mint tokens for participation.
-
-Preconditions:
-
-- reserve_funded == true
-- start_ts <= block_timestamp < maturity_ts
-- amount > 0
-
-Execution Flow (Canonical Order):
-
-1. Update global accumulator.
-2. Update user accumulator.
-3. Increase:
-   - user.locked_amount += amount
-   - total_locked += amount
-4. Transfer lock_mint tokens from participant to Deposit Escrow Account.
-
-Postconditions:
-
-- Deposit Escrow balance increases by amount.
-- Accounting state remains deterministic.
-
-Failure at any stage MUST revert the entire transaction.
-
----
-
 ### 3.4 claim_reward()
 
 Purpose:
@@ -305,33 +276,42 @@ If total_weight_accum == 0, instruction MUST fail.
 ### 3.5 withdraw_deposit()
 
 Purpose:
-Return locked lock_mint tokens after maturity.
+Return locked `lock_mint` tokens to the participant after maturity.
 
 Preconditions:
 
 - block_timestamp >= maturity_ts
 - user.locked_amount > 0
 
-Execution Flow (Defensive Order):
+Execution Flow (Defensive + Finalization Order):
 
-1. Let amount = user.locked_amount.
-2. Decrease total_locked by amount.
-3. Set user.locked_amount = 0.
-4. Transfer amount from Deposit Escrow Account to participant.
+1. Update global accumulator (finalize to `final_day_index`).
+2. Update per-user accumulator (using the same `current_day_index` produced by the global update).
+3. Let `amount = user.locked_amount`.
+4. Decrease `total_locked` by `amount`.
+5. Set `user.locked_amount = 0`.
+6. Transfer `amount` from Deposit Escrow Account to the participant.
 
 Postconditions:
 
-- Deposit Escrow balance decreases.
-- user.locked_amount == 0.
+- Deposit Escrow balance decreases by `amount`.
+- `user.locked_amount == 0`.
+- `user_weight_accum` reflects finalized participation weight up to maturity.
+- Withdrawal remains available indefinitely and does not depend on reward claim status.
 
-Withdrawal remains available indefinitely.
+Notes:
+
+- Accumulator finalization MUST occur before clearing `user.locked_amount`.
+  This prevents loss of final weight if withdrawal is executed before reward claim.
+- State mutation MUST precede token transfer.
+- Any failure MUST revert atomically.
 
 ---
 
 ### 3.6 sweep()
 
 Purpose:
-Transfer unclaimed rewards to platform_treasury after claim window expiration.
+Transfer all unclaimed rewards to `platform_treasury` after claim window expiration.
 
 Preconditions:
 
@@ -340,17 +320,22 @@ Preconditions:
 - reward escrow balance > 0
 - sweep_executed == false
 
-Execution Flow:
+Execution Flow (Canonical Defensive Order):
 
-1. Transfer entire Reward Escrow balance to platform_treasury.
-2. Set sweep_executed = true.
+1. Set `sweep_executed = true`.
+2. Transfer the entire Reward Escrow balance to `platform_treasury`.
 
 Postconditions:
 
 - Reward Escrow balance == 0.
-- sweep_executed == true.
+- `sweep_executed == true`.
 
 Further sweep() calls MUST fail.
+
+Notes:
+
+- State mutation MUST precede token transfer.
+- Any failure MUST revert atomically.
 
 ---
 
@@ -531,17 +516,37 @@ Any mismatch MUST cause failure.
 
 ---
 
-### 5.2 Program-Derived Authority (PDA)
+## 5.2 Program-Derived Authority (PDA) — Canonical v1.1
 
-All escrow token accounts MUST be owned by a program-derived authority (PDA) controlled exclusively by the issuance contract.
+All outbound escrow transfers MUST be authorized exclusively by the
+canonical issuance PDA.
 
-Properties:
+### 5.2.1 Issuance PDA (Canonical Seeds)
 
-- No externally held private key controls escrow accounts.
-- Escrow transfers occur only through contract instructions.
-- PDA derivation MUST be deterministic and unique per issuance.
+The issuance PDA MUST be derived deterministically from immutable parameters:
 
-The PDA MUST be the sole authority permitted to sign token transfers out of escrow.
+- b"issuance"
+- issuer_address (Pubkey)
+- start_ts (i64, little-endian)
+- reserve_total (u128, little-endian)
+
+Seed ordering MUST NOT change in v1.1.
+All numeric seed values MUST be encoded in little-endian format.
+
+The issuance PDA acts as:
+
+- the sole escrow authority for both Deposit Escrow and Reward Escrow
+- the canonical Issuance State account address for the issuance instance
+
+### 5.2.2 UserState PDA Binding
+
+Each participant MUST have a dedicated UserState PDA derived from:
+
+- b"user"
+- issuance_pda
+- participant_pubkey
+
+UserState substitution across issuances MUST be impossible.
 
 ---
 
@@ -562,18 +567,40 @@ No transfer may occur without explicit mint validation.
 
 ### 5.4 Defensive State Mutation Order
 
-For instructions that perform outbound transfers from escrow, the Design enforces:
+For all instructions performing outbound transfers from escrow accounts,
+state mutation MUST precede token transfer.
 
-- state mutation precedes token transfer.
-
-This applies to:
+This rule applies strictly to:
 
 - withdraw_deposit()
-- claim_reward() (reward_claimed set before transfer)
-- sweep() (sweep_executed set before transfer, if implemented as a state flag)
-- zero_participation_reclaim() (no flag required if balance becomes zero, but may be used)
+- claim_reward()
+- sweep()
+- zero_participation_reclaim()
 
-This order minimizes risk from unexpected CPI behavior.
+The canonical order is:
+
+1. Validate preconditions.
+2. Update accumulators (if applicable).
+3. Mutate all required state variables.
+4. Execute outbound CPI token transfer.
+
+Single-execution instructions MUST use irreversible state flags.
+
+Specifically:
+
+- claim_reward() MUST set `reward_claimed = true` before transfer.
+- sweep() MUST set `sweep_executed = true` before transfer.
+- zero_participation_reclaim() MUST set `reclaim_executed = true` before transfer.
+
+The `reclaim_executed` flag is mandatory and not optional.
+
+Reclaim execution MUST be permanently irreversible,
+independent of escrow balance state.
+
+No instruction may rely solely on zero escrow balance
+to enforce single execution.
+
+Failure at any stage MUST revert atomically.
 
 ---
 
@@ -680,13 +707,15 @@ Reward calculation MUST use finalized accumulators.
 1. Validate:
    - block_timestamp >= maturity_ts
    - user.locked_amount > 0
-2. Let amount = user.locked_amount.
-3. Mutate state:
+2. Execute global accumulator finalization (bounded to final_day_index).
+3. Execute per-user accumulator update (using the same current_day_index).
+4. Let amount = user.locked_amount.
+5. Mutate state:
    - total_locked -= amount
    - user.locked_amount = 0
-4. Execute SPL transfer (Deposit Escrow → participant).
+6. Execute SPL transfer (Deposit Escrow → participant) for amount.
 
-Withdrawal remains permanently available.
+State mutation MUST precede token transfer.
 
 ---
 

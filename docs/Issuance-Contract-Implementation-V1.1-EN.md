@@ -183,21 +183,75 @@ The implementation MUST never distribute more than reserve_total.
 
 ---
 
-### 2.6 PDA Derivation Model
+## 2.6 PDA Derivation Model (Canonical — v1.1)
 
-A single Program Derived Address (PDA) controls both escrow accounts.
+A single canonical Program Derived Address (PDA) MUST be used as the
+issuance authority for v1.1.
 
-Example deterministic seed model:
+This PDA is part of the protocol definition and MUST be deterministic,
+stable, and reproducible.
 
-["issuance", issuance_state_pubkey]
+### 2.6.1 Issuance PDA (Authority + Issuance State Address)
 
-The PDA:
+The issuance PDA MUST be derived from the following immutable seeds:
 
-- Has no private key.
-- Signs CPI token transfers.
-- Is unique per issuance instance.
+- b"issuance"
+- issuer_address (Pubkey)
+- start_ts (i64, little-endian)
+- reserve_total (u128, little-endian)
 
-The bump seed MUST be stored or deterministically recomputed during instruction execution.
+Derivation:
+
+Pubkey::find_program_address(
+    [
+        b"issuance",
+        issuer_address.as_ref(),
+        start_ts.to_le_bytes(),
+        reserve_total.to_le_bytes(),
+    ],
+    program_id
+)
+
+The resulting PDA address is:
+
+- the canonical issuance authority (signer for escrow transfers via invoke_signed)
+- the canonical Issuance State account address for this issuance instance
+
+Seed ordering MUST NOT change in v1.1.
+All numeric seed values MUST be little-endian.
+
+### 2.6.2 User State PDA
+
+UserState MUST be derived as:
+
+- b"user"
+- issuance_pda (Pubkey)
+- participant_pubkey (Pubkey)
+
+Derivation:
+
+Pubkey::find_program_address(
+    [
+        b"user",
+        issuance_pda.as_ref(),
+        participant_pubkey.as_ref(),
+    ],
+    program_id
+)
+
+The derived PDA MUST be validated inside every participant instruction.
+
+### 2.6.3 Escrow Authority (Non-PDA Token Accounts)
+
+Deposit escrow and reward escrow are SPL Token Accounts (NOT PDAs).
+
+Both escrow accounts MUST satisfy:
+
+- token_account.owner == SPL Token Program
+- token_account.authority == issuance_pda
+- token_account.mint == expected mint (lock_mint for deposit escrow, USDC for reward escrow)
+
+Any authority or mint mismatch MUST abort execution.
 
 ---
 
@@ -312,13 +366,17 @@ Validation Phase:
 
 Execution Phase:
 
-1. Let amount = user.locked_amount.
-2. Perform checked subtraction:
+1. Execute global accumulator update (finalize to final_day_index).
+2. Execute per-user accumulator update (using the same bounded current_day_index).
+3. Let amount = user.locked_amount.
+4. Perform checked subtraction:
    total_locked -= amount
-3. Set user.locked_amount = 0.
-4. Execute CPI transfer from Deposit Escrow to participant.
+5. Set user.locked_amount = 0.
+6. Execute CPI transfer from Deposit Escrow to participant for amount (invoke_signed).
 
-State mutation MUST precede CPI transfer.
+Accumulator finalization MUST precede clearing user.locked_amount to prevent loss of final weight if withdrawal occurs before claim.
+
+State mutation MUST precede CPI transfer. If CPI fails, the entire instruction MUST revert.
 
 ---
 

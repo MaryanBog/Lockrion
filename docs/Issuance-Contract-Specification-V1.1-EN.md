@@ -76,6 +76,19 @@ Lockrion v1 profile constraints:
 - settlement is a post-maturity claim phase with a fixed `claim_window`,
 - no administrative, governance, pause, or emergency paths exist after deployment.
 
+### Lockrion v1 Override Clause
+
+While the underlying RCT theoretical framework permits
+reserve extension mechanisms in abstract models,
+Lockrion v1 strictly prohibits:
+
+- any reserve increase after deployment,
+- any reserve resizing,
+- any additional funding beyond reserve_total.
+
+This profile-level restriction overrides any theoretical
+reserve flexibility described in the base RCT document.
+
 ---
 
 ### 1.4 Authority and Immutability Model
@@ -144,12 +157,11 @@ These parameters define the full structural commitment of the issuance.
 
 ---
 
-### 2.2 Global State Variables
-
-### 2.2 Global State Variables
+### 2.2 Global State Variables (Including Version Enforcement)
 
 The contract maintains the following global state variables:
 
+- contract_version (u8)
 - reserve_funded (bool)
 - total_locked (u128)
 - total_weight_accum (u128)
@@ -160,8 +172,17 @@ The contract maintains the following global state variables:
 
 Definitions:
 
-- final_day_index = (maturity_ts - start_ts) / 86400
+- contract_version MUST equal 1 for all Lockrion v1.1 deployments.
+- final_day_index = (maturity_ts - start_ts) / 86400.
 - last_day_index represents the last accounting day fully accumulated.
+
+Version Enforcement Rules:
+
+1. contract_version MUST be set at deployment.
+2. All instructions MUST verify contract_version == 1.
+3. Any mismatch MUST return Error::InvalidVersion.
+4. contract_version is immutable after deployment.
+5. Mutation of contract_version MUST return Error::ImmutableFieldMutation.
 
 Global state MUST NOT accumulate weight beyond final_day_index.
 
@@ -506,47 +527,83 @@ Claim window expiration permanently disables reward claims.
 
 ---
 
-### 6.4 Deposit Withdrawal (Revised — Defensive Order)
+### 6.4 Deposit Withdrawal (Revised — Defensive Order + Accumulator Finalization)
 
-Canonical execution order for withdraw_deposit() SHALL be:
+Deposit withdrawals become available strictly after maturity.
+
+Rules:
+
+- withdraw_deposit() MUST fail if block_timestamp < maturity_ts.
+- Withdrawal returns the full user.locked_amount.
+- Withdrawal is not time-limited.
+- Withdrawal does not depend on reward claim status.
+
+**Canonical execution order for withdraw_deposit() SHALL be:**
+
+Validation Phase (no state mutation):
 
 1. Verify block_timestamp >= maturity_ts.
-2. Let amount = user.locked_amount.
-3. Decrease global.total_locked by amount.
-4. Set user.locked_amount = 0.
-5. Execute SPL transfer of amount from Deposit Escrow Account.
+2. Verify user.locked_amount > 0.
+
+Execution Phase:
+
+1. Update global accumulator (finalize to final_day_index).
+2. Update user accumulator (using the same current_day_index computed in the global update).
+3. Let amount = user.locked_amount.
+4. Decrease global.total_locked by amount.
+5. Set user.locked_amount = 0.
+6. Execute SPL transfer of amount from Deposit Escrow Account to the participant.
+
+**Accumulator finalization MUST occur before clearing user.locked_amount.**  
+This ensures the participant’s user_weight_accum is fully finalized even if the participant withdraws before claiming.
 
 State mutation MUST precede token transfer.
 
-Deposit withdrawal is not time-limited.
-Withdrawal does not depend on reward claim status.
-
 ---
 
-### 6.5 Unclaimed Reward Sweep (Revised — Defensive Order Alignment)
+### 6.5 Unclaimed Reward Sweep (Canonical v1.1 Execution Model)
 
 Sweep becomes available strictly when:
 
 block_timestamp >= maturity_ts + claim_window
 
-Conditions:
+Sweep is permitted only if ALL of the following conditions hold:
 
 - total_weight_accum > 0
 - reward escrow balance > 0
 - sweep_executed == false
 
-Canonical execution order:
+Sweep MUST follow the canonical state-transition execution order.
 
-1. Set sweep_executed = true.
-2. Transfer entire remaining reward escrow balance to platform_treasury.
+Validation Phase (no state mutation):
 
-Sweep does not modify:
+1. Verify block_timestamp >= maturity_ts + claim_window.
+2. Verify total_weight_accum > 0.
+3. Verify sweep_executed == false.
+4. Verify reward escrow balance > 0.
 
-- user_weight_accum
+Execution Phase:
+
+1. Update global accumulator (bounded to final_day_index).
+2. Set sweep_executed = true.
+3. Transfer the entire reward escrow balance to platform_treasury.
+
+Accumulator update is mandatory even though sweep does not modify
+weight variables. This enforces canonical deterministic execution order
+across all state-changing instructions.
+
+Sweep does NOT modify:
+
 - total_weight_accum
+- user_weight_accum
 - deposit escrow balances
 
 State mutation MUST precede token transfer.
+
+After execution:
+
+- sweep_executed SHALL remain permanently true.
+- Subsequent sweep attempts MUST fail.
 
 ---
 
@@ -692,18 +749,42 @@ No implicit type casting is permitted.
 
 ---
 
-### 8.2 Overflow Protection
+### 8.2 Overflow Protection and Arithmetic Domain Constraints
 
-The contract MUST enforce checked arithmetic for:
+All arithmetic operations MUST use checked integer arithmetic.
 
-- total_locked updates,
-- total_weight_accum updates,
-- user_weight_accum updates,
-- reward calculation.
+The following operations MUST use checked variants:
 
-If any intermediate calculation exceeds type bounds, the transaction MUST revert.
+- Addition (checked_add)
+- Subtraction (checked_sub)
+- Multiplication (checked_mul)
+- Division (checked_div)
 
-Overflow MUST NOT result in silent truncation.
+Any overflow or underflow MUST cause transaction failure.
+
+Silent truncation is strictly prohibited.
+
+Arithmetic Domain Constraints:
+
+To ensure deterministic safety within u128 bounds, the following
+deployment-level assumptions MUST hold:
+
+- reserve_total ≤ 2^120
+- locked_amount per user ≤ 2^120
+- total_locked ≤ 2^120
+- final_day_index ≤ 2^32
+
+Under these constraints:
+
+total_locked * final_day_index
+remains within safe u128 limits.
+
+If deployment parameters exceed safe domain assumptions,
+transactions MAY deterministically revert due to overflow checks.
+
+The protocol does not implement dynamic range scaling.
+
+Arithmetic safety is enforced structurally through checked operations.
 
 ---
 
