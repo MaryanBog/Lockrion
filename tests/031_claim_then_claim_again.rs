@@ -23,7 +23,6 @@ async fn send_tx(
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
 
-    // ВАЖНО: signers живут только тут => нет E0502
     let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
     signers.push(&ctx.payer);
     signers.extend_from_slice(extra_signers);
@@ -32,32 +31,35 @@ async fn send_tx(
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
-async fn clock_unix_ts(ctx: &mut ProgramTestContext) -> i64 {
-    let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
-    c.unix_timestamp
+async fn try_tx(
+    ctx: &mut ProgramTestContext,
+    ixs: Vec<Instruction>,
+    extra_signers: &[&Keypair],
+) -> Result<(), BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
+    signers.extend_from_slice(extra_signers);
+
+    tx.sign(&signers, bh);
+    ctx.banks_client.process_transaction(tx).await
 }
 
-async fn root_slot(ctx: &mut ProgramTestContext) -> u64 {
-    ctx.banks_client.get_root_slot().await.unwrap()
-}
-
-// Главная идея: двигаем СЛОТ, пока Clock.unix_timestamp не станет >= target_ts.
 async fn warp_until_ts(ctx: &mut ProgramTestContext, target_ts: i64) {
-    let mut iters = 0u32;
     loop {
-        let now = clock_unix_ts(ctx).await;
+        let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
+        let now: i64 = (c.slot as i64) / 2;
+
         if now >= target_ts {
             return;
         }
 
-        let s = root_slot(ctx).await;
-        // шаг варпа: достаточно большой, чтобы time рос, но не “в бесконечность”
-        ctx.warp_to_slot(s + 2_000).unwrap();
-
-        iters += 1;
-        if iters > 2000 {
-            panic!("warp_until_ts: could not reach target_ts={target_ts} (now={now})");
-        }
+        let need = (target_ts - now) as u64;
+        let jump_slots = need.saturating_mul(2);
+        ctx.warp_to_slot(c.slot + jump_slots + 10).unwrap();
     }
 }
 
@@ -128,7 +130,7 @@ async fn mint_to(
         mint,
         dst,
         &mint_authority.pubkey(),
-        &[],
+        &[] as &[&Pubkey],
         amount,
     )
     .unwrap();
@@ -147,7 +149,7 @@ fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruct
 }
 
 #[tokio::test]
-async fn claim_happy_program_test() {
+async fn claim_then_claim_again() {
     let program_id = lockrion_issuance_v1_1::id();
 
     let pt = ProgramTest::new(
@@ -157,7 +159,6 @@ async fn claim_happy_program_test() {
     );
 
     let mut ctx = pt.start_with_context().await;
-
     let payer_pk = ctx.payer.pubkey();
 
     // -------- params --------
@@ -167,10 +168,7 @@ async fn claim_happy_program_test() {
     let reserve_total: u128 = 1000;
     let deposit_amount: u64 = 100;
 
-    // fund_reserve требует now < start_ts
     let start_ts: i64 = now + 10;
-
-    // ВАЖНО: чтобы появился вес (день = 86400), maturity должен быть минимум +86400
     let maturity_ts: i64 = start_ts + 86_400;
 
     // -------- issuance PDA --------
@@ -188,7 +186,7 @@ async fn claim_happy_program_test() {
     // -------- token accounts --------
     let deposit_escrow = Keypair::new();
     let reward_escrow  = Keypair::new();
-    
+
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(),  &issuance_pda).await;
     create_token_account(&mut ctx, &reward_escrow,  &reward_mint.pubkey(), &issuance_pda).await;
 
@@ -229,13 +227,13 @@ async fn claim_happy_program_test() {
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),                 // payer
-            AccountMeta::new(issuance_pda, false),            // issuance PDA (ещё не существует — это ок)
+            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false),       // platform_treasury
+            AccountMeta::new_readonly(payer_pk, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
@@ -273,7 +271,7 @@ async fn claim_happy_program_test() {
         dep_data,
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(user_pda, false),               // user PDA (контракт создаст через system_program)
+            AccountMeta::new(user_pda, false),
             AccountMeta::new(payer_pk, true),
             AccountMeta::new(participant_lock.pubkey(), false),
             AccountMeta::new(deposit_escrow.pubkey(), false),
@@ -283,14 +281,38 @@ async fn claim_happy_program_test() {
     );
     send_tx(&mut ctx, vec![dep_ix], &[]).await;
 
-    // -------- claim (ПОСЛЕ maturity_ts) --------
+    // -------- claim #1 (ПОСЛЕ maturity_ts) --------
     warp_until_ts(&mut ctx, maturity_ts).await;
 
-    let before = token_balance(&mut ctx, &participant_reward.pubkey()).await;
+    let reward_before_1 = token_balance(&mut ctx, &participant_reward.pubkey()).await;
+    let escrow_before_1 = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
 
     let claim_data = LockrionInstruction::ClaimReward.try_to_vec().unwrap();
+    let claim_ix_1 = mk_ix(
+        program_id,
+        claim_data.clone(),
+        vec![
+            AccountMeta::new(issuance_pda, false),
+            AccountMeta::new(user_pda, false),
+            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_reward.pubkey(), false),
+            AccountMeta::new(reward_escrow.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    );
+    send_tx(&mut ctx, vec![claim_ix_1], &[]).await;
 
-    let claim_ix = mk_ix(
+    let reward_after_1 = token_balance(&mut ctx, &participant_reward.pubkey()).await;
+    let escrow_after_1 = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
+
+    assert!(reward_after_1 > reward_before_1, "first claim did not increase reward");
+    assert!(escrow_after_1 < escrow_before_1, "escrow did not decrease after first claim");
+
+    // -------- claim #2 (MUST FAIL) --------
+    let reward_before_2 = reward_after_1;
+    let escrow_before_2 = escrow_after_1;
+
+    let claim_ix_2 = mk_ix(
         program_id,
         claim_data,
         vec![
@@ -302,8 +324,14 @@ async fn claim_happy_program_test() {
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx(&mut ctx, vec![claim_ix], &[]).await;
 
-    let after = token_balance(&mut ctx, &participant_reward.pubkey()).await;
-    assert!(after > before, "reward did not increase: before={before} after={after}");
+    let res2 = try_tx(&mut ctx, vec![claim_ix_2], &[]).await;
+    assert!(res2.is_err(), "second claim unexpectedly succeeded");
+
+    // No double transfer:
+    let reward_after_2 = token_balance(&mut ctx, &participant_reward.pubkey()).await;
+    let escrow_after_2 = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
+
+    assert_eq!(reward_after_2, reward_before_2);
+    assert_eq!(escrow_after_2, escrow_before_2);
 }
