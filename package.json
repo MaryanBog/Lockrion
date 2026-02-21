@@ -1,0 +1,35 @@
+{
+  "name": "lockrion",
+  "version": "1.0.0",
+  "description": "Lockrion v1.1 is a Solana-based issuance protocol.  \r This repository contains the smart contract (SBF/BPF program), deployment scripts, and instructions for running a local test environment.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MaryanBog/Lockrion.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/MaryanBog/Lockrion/issues"
+  },
+  "homepage": "https://github.com/MaryanBog/Lockrion#readme",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "solana-bankrun": "^0.4.0",
+    "spl-token-bankrun": "^0.2.6"
+  }
+}

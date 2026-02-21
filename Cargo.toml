@@ -10,12 +10,19 @@ crate-type = ["cdylib", "lib"]
 default = []
 custom-heap = []
 custom-panic = []
+test-clock = []
 
 [dependencies]
 solana-program = "1.18.22"
 spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
 borsh = "0.10.4"
 thiserror = "1.0.56"
+
+[dev-dependencies]
+solana-program-test = "1.18.22"
+solana-sdk = "1.18.22"
+spl-associated-token-account = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [profile.release]
 overflow-checks = true

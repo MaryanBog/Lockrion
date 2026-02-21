@@ -7,12 +7,24 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub enum LockrionInstruction {
-    /// fund_reserve(amount: u64) - amount must equal reserve_total (u128) in state;
-    /// we still pass u64 for client convenience; program will validate exactness vs reserve_total.
-    FundReserve { amount: u64 },
+    /// InitIssuance(reserve_total, start_ts, maturity_ts)
+    /// Creates and initializes issuance state account.
+    InitIssuance {
+        reserve_total: u128,
+        start_ts: i64,
+        maturity_ts: i64,
+    },
 
-    /// deposit(amount: u64) - amount > 0
-    Deposit { amount: u64 },
+    /// fund_reserve(amount: u64)
+    /// amount must equal reserve_total (u128) in state.
+    FundReserve {
+        amount: u64,
+    },
+
+    /// deposit(amount: u64)
+    Deposit {
+        amount: u64,
+    },
 
     /// claim_reward()
     ClaimReward,

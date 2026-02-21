@@ -1,6 +1,7 @@
 // ==============================
 // src/lib.rs
 // ==============================
+#![allow(unexpected_cfgs)]
 #![deny(warnings)]
 #![forbid(unsafe_code)]
 

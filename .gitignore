@@ -60,3 +60,7 @@ Desktop.ini
 # =========================
 /C:/
 /C/
+
+node_modules/
+*.lock
+.DS_Store

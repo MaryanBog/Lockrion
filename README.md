@@ -1,93 +1,143 @@
 # Lockrion v1.1
 
-Lockrion is a Solana-based issuance protocol. This repository contains the smart contract (BPF program), deployment scripts, and instructions for running a local test environment using WSL2 or Linux.
+Lockrion v1.1 is a Solana-based issuance protocol.  
+This repository contains the smart contract (SBF/BPF program), deployment scripts, and instructions for running a local test environment.
 
-## Table of Contents
-
-- Requirements
-- Setup
-- Building the Program
-- Running a Local Validator
-- Deploying Lockrion
-- Testing Instructions
+---
 
 ## Requirements
 
-- WSL2 (Windows) or native Linux environment
-- Rust toolchain (rustup)
-- Solana CLI v1.18.22
-- Node.js & NPM (optional, for Agave 3.1.8 helpers)
+- WSL2 (Windows) or native Linux
+- Rust (rustup)
+- Solana CLI 3.1.8 (Agave)
 - Git
 
-## Setup
+Verify:
 
-1. Clone the repository:
-git clone https://github.com/YourUsername/Lockrion.git
-cd Lockrion
+solana --version  
+Expected: solana-cli 3.1.8 (Agave)
 
-2. Make sure Solana CLI is installed:
-solana --version
-# Expected: solana-cli 1.18.22 or compatible
+Note: `solana-program = 1.18.22` is a Rust dependency (Cargo.toml), not the CLI version.
 
-3. Ensure Rust is installed and the BPF target is added:
-rustup default stable
-rustup target add bpfel-unknown-unknown
+---
 
 ## Building the Program
 
-To build the Lockrion BPF program:
+Lockrion is a raw Solana program (no Anchor).
+
+Build inside WSL2 or Linux:
+
 cargo build-sbf
-# Output: target/deploy/lockrion_issuance_v1_1.so
 
-## Running a Local Validator
+Expected artifact:
 
-Start a local Solana validator to test the program:
+target/deploy/lockrion_issuance_v1_1.so
+
+The `.so` must exist before deployment.
+
+---
+
+## Local Execution Model (FINAL)
+
+This project uses strict environment separation.
+
+### 🟢 WSL2 / Linux
+
+WSL2 runs ONLY the local validator.
+
+Start validator:
+
 solana-test-validator --reset
 
-- Ledger is created in test-ledger/
-- RPC URL: http://127.0.0.1:8899
-- Keep this terminal running while testing
+RPC endpoint:
 
-## Deploying Lockrion
+http://127.0.0.1:8899
 
-Назвать файл deploy_lockrion.sh
+WSL2 does NOT:
+- create wallets
+- deploy programs
+- run tests
+- manage keypairs
 
-Запускать только внутри WSL2, например:
+WSL2 = blockchain node only.
 
-cd ~/lockrion
-chmod +x deploy_lockrion.sh
-./deploy_lockrion.sh
+---
 
-потом запускаем команды на Git bash 
+### 🔵 Git Bash (Windows)
 
-chmod +x deploy_lockrion_gitbash.sh
-./deploy_lockrion_gitbash.sh
+Git Bash handles ALL operational logic:
 
-## Testing Instructions
+- Wallet creation
+- Program-id generation
+- Airdrop
+- Program deployment
+- Instruction execution
+- All testing
 
-Once deployed, you can test Lockrion operations:
-- fund_reserve
-- deposit
-- claim_reward
-- withdraw_deposit
-- sweep
-- zero_participation_reclaim
+All keypairs are stored in:
 
-All operations are performed on the local validator RPC (http://127.0.0.1:8899) using the same keypairs from target/deploy/.
+target/deploy/
 
-## Optional: Using Agave 3.1.8 Helpers
+All interactions use:
 
-If you want to automate local testnets or program interactions:
-npm install -g agave@3.1.8
-agave local start
+http://127.0.0.1:8899
 
-This will setup a local Solana testnet with pre-funded accounts for faster development.
+Git Bash = operator layer.
 
-## Notes
+---
 
-- Always use WSL2 or Linux for reliable validator operation on Windows.
-- Git Bash on Windows cannot reliably run solana-test-validator due to file system and networking limitations.
-- Keep ledger clean with --reset if errors occur during validator startup.
+## Deployment Flow
+
+### Step 1 — Start Validator (WSL2)
+
+Open WSL2:
+
+solana-test-validator --reset
+
+Leave it running.
+
+---
+
+### Step 2 — Deploy (Git Bash)
+
+Open Git Bash in project directory:
+
+chmod +x deploy_lockrion_gitbash.sh  
+./deploy_lockrion_gitbash.sh  
+
+This script:
+
+- connects to local RPC
+- creates payer wallet if missing
+- airdrops SOL
+- generates program-id keypair
+- deploys upgradeable Lockrion program
+
+After completion:
+
+solana program show <PROGRAM_ID>
+
+---
+
+## Testing
+
+All tests are executed from Git Bash  
+against the local validator at:
+
+http://127.0.0.1:8899
+
+Validator must be running before tests.
+
+---
+
+## Rules
+
+- Do NOT deploy from WSL2
+- Do NOT create wallets in WSL2
+- Do NOT run validator in Git Bash
+- Do NOT mix environments
+
+---
 
 ## License
 

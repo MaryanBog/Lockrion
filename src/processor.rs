@@ -3,6 +3,8 @@
 // ==============================
 #![forbid(unsafe_code)]
 
+use solana_program::{program::invoke_signed, system_instruction, system_program, rent::Rent};
+
 use borsh::BorshDeserialize;
 use solana_program::program_pack::Pack;
 
@@ -31,6 +33,8 @@ impl Processor {
     pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], ix_data: &[u8]) -> ProgramResult {
         let ix = LockrionInstruction::try_from_slice(ix_data).map_err(|_| LockrionError::InvalidInstruction)?;
         match ix {
+            LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts } =>
+            Self::init_issuance(program_id, accounts, reserve_total, start_ts, maturity_ts),
             LockrionInstruction::FundReserve { amount } => Self::fund_reserve(program_id, accounts, amount),
             LockrionInstruction::Deposit { amount } => Self::deposit(program_id, accounts, amount),
             LockrionInstruction::ClaimReward => Self::claim_reward(program_id, accounts),
@@ -82,7 +86,7 @@ impl Processor {
             return Err(LockrionError::UnauthorizedCaller.into());
         }
 
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
         if now >= issuance.start_ts {
             return Err(LockrionError::FundingWindowClosed.into());
         }             
@@ -128,15 +132,16 @@ impl Processor {
     // deposit(amount)
     // Accounts:
     // 0 [writable] issuance_state (PDA)
-    // 1 [writable] user_state (PDA)
-    // 2 [signer]   participant
+    // 1 [writable] user_state (PDA)        (may be uninitialized; created here)
+    // 2 [signer]   participant             (payer for UserState creation)
     // 3 [writable] participant_lock_ata
     // 4 [writable] deposit_escrow
     // 5 []         token_program
+    // 6 []         system_program
     // ---------------------------------------------------------------------
     fn deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         if amount == 0 {
-            return Err(LockrionError::InvalidInstruction.into());
+            return Err(LockrionError::InvalidAmount.into());
         }
 
         let acc_iter = &mut accounts.iter();
@@ -146,6 +151,12 @@ impl Processor {
         let participant_lock_ata_ai = next_account_info(acc_iter)?;
         let deposit_escrow_ai = next_account_info(acc_iter)?;
         let token_program_ai = next_account_info(acc_iter)?;
+
+        let system_program_ai = next_account_info(acc_iter)?;
+
+        if system_program_ai.key != &system_program::ID {
+           return Err(LockrionError::InvalidInstruction.into());
+        }
 
         Self::validate_token_program(token_program_ai)?;
 
@@ -165,7 +176,7 @@ impl Processor {
             return Err(LockrionError::ReserveNotFunded.into());
         }
 
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
         if now < issuance.start_ts {
             return Err(LockrionError::DepositWindowNotStarted.into());
         }
@@ -187,9 +198,50 @@ impl Processor {
         if user_state_ai.key != &user_pda {
             return Err(LockrionError::InvalidPda.into());
         }
-        if user_state_ai.owner != program_id {
-            return Err(LockrionError::InvalidUserStateAccount.into());
-        }
+        // If user_state is not initialized yet — create it (payer = participant)
+        Self::create_user_state_if_needed(
+          program_id,
+          &issuance_pda,
+          user_state_ai,
+          participant_ai,
+          user_bump,
+        )?;
+
+        // If freshly created or uninitialized: initialize EXACT bytes per State Layout v1.1
+        // UserState layout offsets:
+        // 0 version(u8)=1
+        // 1 bump(u8)
+        // 2 issuance(Pubkey)[32]
+        // 34 participant(Pubkey)[32]
+        // 66 locked_amount(u128)=0
+        // 82 user_weight_accum(u128)=0
+        // 98 user_last_day_index(u64)=issuance.last_day_index
+        // 106 reward_claimed(u8)=0
+        // 107..111 padding[5]=0
+    {
+    let mut d = user_state_ai.try_borrow_mut_data()?;
+
+    // initialize only if version != 1 (fresh account will be all-zero)
+    if d[0] != 1 {
+        // version
+        d[0] = 1;
+        // bump
+        d[1] = user_bump;
+
+        // issuance pubkey bytes
+        d[2..34].copy_from_slice(issuance_ai.key.as_ref());
+
+        // participant pubkey bytes
+        d[34..66].copy_from_slice(participant_ai.key.as_ref());
+
+        // locked_amount + user_weight_accum already zero (leave as-is)
+        // user_last_day_index = issuance.last_day_index
+        d[98..106].copy_from_slice(&issuance.last_day_index.to_le_bytes());
+
+        // reward_claimed = 0 (leave)
+        // padding = 0 (leave)
+    }
+}
 
         // Load user state (assumes already created/initialized by separate init instruction OR off-chain create)
         // NOTE: v1 spec set exposes only 6 instructions; значит UserState должен существовать заранее,
@@ -296,7 +348,7 @@ impl Processor {
         Self::validate_token_account_authority(reward_escrow_ai, &issuance_pda)?;
     
         // Window checks
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
     
         if now < issuance.maturity_ts {
             return Err(LockrionError::ClaimWindowNotStarted.into());
@@ -426,7 +478,7 @@ impl Processor {
         Self::validate_token_account_authority(deposit_escrow_ai, &issuance_pda)?;
     
         // Time gate: only after maturity
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
         if now < issuance.maturity_ts {
             return Err(LockrionError::DepositWindowNotClosed.into());
         }
@@ -538,7 +590,7 @@ impl Processor {
             return Err(LockrionError::SweepAlreadyExecuted.into());
         }
     
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
         let sweep_start = issuance
             .maturity_ts
             .checked_add(issuance.claim_window)
@@ -647,7 +699,7 @@ impl Processor {
         Self::validate_token_account_mint(issuer_reward_ata_ai, &issuance.reward_mint)?;
     
         // Time gate: only after maturity
-        let now = Clock::get()?.unix_timestamp;
+        let now = Self::now_ts();
         if now < issuance.maturity_ts {
             return Err(LockrionError::ClaimWindowNotStarted.into()); // reclaim not available pre-maturity
         }
@@ -697,9 +749,171 @@ impl Processor {
         Ok(())
     }    
 
+    fn init_issuance(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        reserve_total: u128,
+        start_ts: i64,
+        maturity_ts: i64,
+    ) -> ProgramResult {
+        let acc_iter = &mut accounts.iter();
+    
+        let payer_ai = next_account_info(acc_iter)?;
+        let issuance_ai = next_account_info(acc_iter)?;
+        let lock_mint_ai = next_account_info(acc_iter)?;
+        let reward_mint_ai = next_account_info(acc_iter)?;
+        let deposit_escrow_ai = next_account_info(acc_iter)?;
+        let reward_escrow_ai = next_account_info(acc_iter)?;
+        let platform_treasury_ai = next_account_info(acc_iter)?;
+        let system_program_ai = next_account_info(acc_iter)?;
+    
+        if !payer_ai.is_signer {
+            return Err(LockrionError::UnauthorizedCaller.into());
+        }
+    
+        if system_program_ai.key != &solana_program::system_program::id() {
+            return Err(LockrionError::InvalidTokenProgram.into());
+        }
+    
+        if reserve_total == 0 {
+            return Err(LockrionError::InvalidAmount.into());
+        }
+    
+        let (issuance_pda, bump) =
+            pda::derive_issuance_pda(program_id, payer_ai.key, start_ts, reserve_total);
+    
+        if issuance_ai.key != &issuance_pda {
+            return Err(LockrionError::InvalidPda.into());
+        }
+    
+        // must be uninitialized before create_account
+        if issuance_ai.owner != &solana_program::system_program::id() || issuance_ai.data_len() != 0 {
+            return Err(LockrionError::InvalidEscrowAccount.into());
+        }
+    
+        let rent = solana_program::rent::Rent::get()?;
+        let lamports = rent.minimum_balance(crate::state::ISSUANCE_STATE_SIZE);
+    
+        solana_program::program::invoke_signed(
+            &solana_program::system_instruction::create_account(
+                payer_ai.key,
+                issuance_ai.key,
+                lamports,
+                crate::state::ISSUANCE_STATE_SIZE as u64,
+                program_id,
+            ),
+            &[payer_ai.clone(), issuance_ai.clone(), system_program_ai.clone()],
+            &[&[
+                pda::SEED_ISSUANCE,
+                payer_ai.key.as_ref(),
+                &start_ts.to_le_bytes(),
+                &reserve_total.to_le_bytes(),
+                &[bump],
+            ]],
+        )?;
+    
+        let final_day_index = if maturity_ts > start_ts {
+            ((maturity_ts - start_ts) / 86400) as u64
+        } else {
+            0u64
+        };
+    
+        let issuance = IssuanceState {
+            version: crate::state::STATE_VERSION,
+            bump,
+            issuer_address: *payer_ai.key,
+    
+            lock_mint: *lock_mint_ai.key,
+            reward_mint: *reward_mint_ai.key,
+            deposit_escrow: *deposit_escrow_ai.key,
+            reward_escrow: *reward_escrow_ai.key,
+            platform_treasury: *platform_treasury_ai.key,
+    
+            reserve_total,
+            start_ts,
+            maturity_ts,
+            claim_window: 90 * 86400,
+            final_day_index,
+    
+            total_locked: 0,
+            total_weight_accum: 0,
+            last_day_index: 0,
+    
+            reserve_funded: 0,
+            sweep_executed: 0,
+            reclaim_executed: 0,
+            reserved_padding: [0u8; 7],
+        };
+    
+        issuance.pack(&mut issuance_ai.try_borrow_mut_data()?)?;
+    
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
+
+    fn now_ts() -> i64 {
+        let c = Clock::get().unwrap();
+    
+        #[cfg(feature = "test-clock")]
+        {
+            (c.slot as i64) / 2
+        }
+    
+        #[cfg(not(feature = "test-clock"))]
+        {
+            c.unix_timestamp
+        }
+    }
+
+    fn create_user_state_if_needed<'a>(
+        program_id: &Pubkey,
+        issuance_pda: &Pubkey,
+        user_state_ai: &AccountInfo<'a>,
+        participant_ai: &AccountInfo<'a>,
+        user_bump: u8,
+    ) -> ProgramResult {
+        // already program-owned => exists
+        if user_state_ai.owner == program_id {
+            return Ok(());
+        }
+    
+        // must be system-owned placeholder (uninitialized)
+        if user_state_ai.owner != &system_program::ID {
+            return Err(LockrionError::InvalidUserStateAccount.into());
+        }
+    
+        // Create PDA account (rent-exempt) of exact size 112 bytes
+        let space: u64 = 112;
+        let lamports = Rent::get()?.minimum_balance(space as usize);
+    
+        let ix = system_instruction::create_account(
+            participant_ai.key,
+            user_state_ai.key,
+            lamports,
+            space,
+            program_id,
+        );
+    
+        let bump_seed = [user_bump];
+        let seeds: &[&[u8]] = &[
+            pda::SEED_USER,              // b"user"
+            issuance_pda.as_ref(),
+            participant_ai.key.as_ref(),
+            &bump_seed,
+        ];
+    
+        invoke_signed(
+            &ix,
+            &[participant_ai.clone(), user_state_ai.clone()],
+            &[seeds],
+        )?;
+    
+        Ok(())
+    }
+
     fn validate_token_program(token_program_ai: &AccountInfo) -> ProgramResult {
         if token_program_ai.key != &spl_token::id() {
             return Err(LockrionError::InvalidTokenProgram.into());
