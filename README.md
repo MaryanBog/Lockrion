@@ -1,188 +1,154 @@
 # Lockrion v1.1
 
-Lockrion v1.1 is a deterministic Solana-based issuance protocol.
+Lockrion v1.1 is a deterministic Solana issuance protocol implemented as a raw SBF/BPF program (no Anchor).
 
 This repository contains:
 
-- Raw Solana smart contract (SBF/BPF, no Anchor)
-- Deployment scripts
-- Full local execution model
-- Complete deterministic test suite (001–046 + unit tests)
-
-All tests are passing.
-
----
-
-## Protocol Status
-
-Version: v1.1  
-Architecture: Non-Anchor raw Solana program  
-Execution Model: Deterministic  
-Arithmetic: Checked u128  
-Time Model: Discrete 86400-second day index  
-Upgradeability: Upgrade authority intended to be revoked after deployment  
-
-Full test coverage includes:
-
-- Funding logic
-- Deposit window boundaries
-- Claim logic
-- Sweep logic
-- Zero-participation reclaim
-- Arithmetic overflow guards
-- Escrow substitution protection
-- PDA seed mutation protection
-- Deterministic replay guarantee
-
-See `TEST-STATUS.md` for complete list.
+- On-chain program source code
+- Deployment script
+- Production issuance creation template
 
 ---
 
 ## Requirements
 
-- WSL2 (Windows) or native Linux
+- Linux or WSL2
 - Rust (rustup)
 - Solana CLI 3.1.8 (Agave)
-- Git
+- Node.js (for issuance script)
+- spl-token CLI
 
-Verify:
+Verify Solana version:
 
-solana --version  
-Expected: solana-cli 3.1.8 (Agave)
+solana --version
 
-Note: `solana-program = 1.18.22` is a Rust dependency (Cargo.toml), not the CLI version.
+Expected:
+solana-cli 3.1.8 (Agave)
+
+Note:
+`solana-program = 1.18.22` is a Cargo dependency and unrelated to the CLI version.
 
 ---
 
-## Building the Program
+# 1. Build the Program
 
-Lockrion is a raw Solana program (no Anchor).
+Build inside Linux or WSL2:
 
-Build inside WSL2 or Linux:
+cargo build-sbf --no-default-features
 
-cargo build-sbf
-
-Expected artifact:
+Expected output:
 
 target/deploy/lockrion_issuance_v1_1.so
 
-The `.so` must exist before deployment.
+This file is the deployable on-chain binary.
 
 ---
 
-## Local Execution Model (FINAL)
+# 2. Deploy the Program to Blockchain
 
-Strict environment separation is enforced.
+Deploy to mainnet:
 
-### 🟢 WSL2 / Linux
+solana config set --url https://api.mainnet-beta.solana.com
+solana program deploy target/deploy/lockrion_issuance_v1_1.so
 
-WSL2 runs ONLY the local validator.
+After deployment, you will receive:
 
-Start validator:
+Program Id: <PROGRAM_ID>
 
-solana-test-validator --reset
-
-RPC endpoint:
-
-http://127.0.0.1:8899
-
-WSL2 does NOT:
-
-- create wallets
-- deploy programs
-- run tests
-- manage keypairs
-
-WSL2 = blockchain node only.
-
----
-
-### 🔵 Git Bash (Windows)
-
-Git Bash handles ALL operational logic:
-
-- Wallet creation
-- Program-id generation
-- Airdrop
-- Program deployment
-- Instruction execution
-- All testing
-
-All keypairs are stored in:
-
-target/deploy/
-
-All interactions use:
-
-http://127.0.0.1:8899
-
-Git Bash = operator layer.
-
----
-
-## Deployment Flow
-
-### Step 1 — Start Validator (WSL2)
-
-Open WSL2:
-
-solana-test-validator --reset
-
-Leave it running.
-
----
-
-### Step 2 — Deploy (Git Bash)
-
-Open Git Bash in project directory:
-
-chmod +x deploy_lockrion_gitbash.sh  
-./deploy_lockrion_gitbash.sh  
-
-This script:
-
-- connects to local RPC
-- creates payer wallet if missing
-- airdrops SOL
-- generates program-id keypair
-- deploys upgradeable Lockrion program
-
-After completion:
+Verify:
 
 solana program show <PROGRAM_ID>
 
 ---
 
-## Testing
+## Optional: Make Program Immutable
 
-All tests are executed from Git Bash  
-against the local validator at:
+After verifying everything is correct, you may finalize the program:
 
-http://127.0.0.1:8899
+solana program set-upgrade-authority <PROGRAM_ID> --final
 
-Validator must be running before tests.
+This permanently removes upgrade authority.
 
-Run Rust program tests:
-
-cargo test --features test-clock -- --nocapture
-
-Production build check:
-
-cargo build-sbf --no-default-features
-
-All tests must pass before release.
+After this:
+- Code cannot be modified
+- Program becomes immutable
+- No further upgrades are possible
 
 ---
 
-## Rules
+# 3. Create a New Issuance
 
-- Do NOT deploy from WSL2
-- Do NOT create wallets in WSL2
-- Do NOT run validator in Git Bash
-- Do NOT mix environments
+Deploying the program does NOT create an issuance.
+
+Each issuance must be created manually using:
+
+create_issuance_mainnet.sh
+
+This script:
+
+- Derives the canonical Issuance PDA
+- Creates escrow accounts
+- Calls init_issuance
+- Writes immutable economic parameters on-chain
 
 ---
 
-## License
+## Before Running Issuance Script
+
+Open:
+
+create_issuance_mainnet.sh
+
+Replace the placeholders:
+
+PROGRAM_ID="PUT_YOUR_PROGRAM_ID_HERE"
+
+START_TS=PUT_START_TIMESTAMP
+MATURITY_TS=PUT_MATURITY_TIMESTAMP
+
+LOCK_MINT="PUT_LOCK_MINT_ADDRESS"
+REWARD_MINT="PUT_REWARD_MINT_ADDRESS"
+
+PLATFORM_TREASURY="PUT_PROJECT_TREASURY_ADDRESS"
+
+Verify:
+
+RPC_URL="https://api.mainnet-beta.solana.com"
+ISSUER_WALLET="mainnet-issuer.json"
+
+Ensure:
+
+- The issuer wallet exists
+- The wallet contains sufficient SOL
+- All mint addresses are correct
+- Parameters are reviewed carefully
+
+Issuance parameters cannot be changed after creation.
+
+---
+
+## Run Issuance Script
+
+chmod +x create_issuance_mainnet.sh
+./create_issuance_mainnet.sh
+
+If successful, the script will output:
+
+ISSUANCE_PDA=<address>
+
+That address represents the live issuance instance.
+
+---
+
+# Deployment Model
+
+1. Deploy program (once)
+2. Optionally finalize program
+3. Create issuance instances as needed
+4. Each issuance is independent and immutable
+
+---
+
+# License
 
 MIT License
