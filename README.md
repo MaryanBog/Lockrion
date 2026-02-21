@@ -1,7 +1,40 @@
 # Lockrion v1.1
 
-Lockrion v1.1 is a Solana-based issuance protocol.  
-This repository contains the smart contract (SBF/BPF program), deployment scripts, and instructions for running a local test environment.
+Lockrion v1.1 is a deterministic Solana-based issuance protocol.
+
+This repository contains:
+
+- Raw Solana smart contract (SBF/BPF, no Anchor)
+- Deployment scripts
+- Full local execution model
+- Complete deterministic test suite (001–046 + unit tests)
+
+All tests are passing.
+
+---
+
+## Protocol Status
+
+Version: v1.1  
+Architecture: Non-Anchor raw Solana program  
+Execution Model: Deterministic  
+Arithmetic: Checked u128  
+Time Model: Discrete 86400-second day index  
+Upgradeability: Upgrade authority intended to be revoked after deployment  
+
+Full test coverage includes:
+
+- Funding logic
+- Deposit window boundaries
+- Claim logic
+- Sweep logic
+- Zero-participation reclaim
+- Arithmetic overflow guards
+- Escrow substitution protection
+- PDA seed mutation protection
+- Deterministic replay guarantee
+
+See `TEST-STATUS.md` for complete list.
 
 ---
 
@@ -39,7 +72,7 @@ The `.so` must exist before deployment.
 
 ## Local Execution Model (FINAL)
 
-This project uses strict environment separation.
+Strict environment separation is enforced.
 
 ### 🟢 WSL2 / Linux
 
@@ -54,6 +87,7 @@ RPC endpoint:
 http://127.0.0.1:8899
 
 WSL2 does NOT:
+
 - create wallets
 - deploy programs
 - run tests
@@ -127,6 +161,16 @@ against the local validator at:
 http://127.0.0.1:8899
 
 Validator must be running before tests.
+
+Run Rust program tests:
+
+cargo test --features test-clock -- --nocapture
+
+Production build check:
+
+cargo build-sbf --no-default-features
+
+All tests must pass before release.
 
 ---
 
