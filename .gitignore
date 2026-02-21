@@ -64,3 +64,4 @@ Desktop.ini
 node_modules/
 *.lock
 .DS_Store
+reward-escrow.json
