@@ -27,6 +27,10 @@ use crate::{
     state::{IssuanceState, UserState},
 };
 
+// Platform-only init gate (hardcoded authority)
+pub const PLATFORM_AUTHORITY: solana_program::pubkey::Pubkey =
+    solana_program::pubkey!("B9xmmg2zPMSwPg7iX7a9J2j6SK5LcopZ8abRDj9ughxw");
+
 pub struct Processor;
 
 impl Processor {
@@ -767,11 +771,16 @@ impl Processor {
         let platform_treasury_ai = next_account_info(acc_iter)?;
         let system_program_ai = next_account_info(acc_iter)?;
     
+        // --- Platform-only gate ---
         if !payer_ai.is_signer {
+            return Err(LockrionError::UnauthorizedCaller.into());
+        }
+        if payer_ai.key != &PLATFORM_AUTHORITY {
             return Err(LockrionError::UnauthorizedCaller.into());
         }
     
         if system_program_ai.key != &solana_program::system_program::id() {
+            // keep existing error enum usage to avoid changing error surface
             return Err(LockrionError::InvalidTokenProgram.into());
         }
     

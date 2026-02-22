@@ -65,3 +65,4 @@ node_modules/
 *.lock
 .DS_Store
 reward-escrow.json
+platform-authority.json
