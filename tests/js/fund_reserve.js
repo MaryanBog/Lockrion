@@ -13,7 +13,7 @@ const issuerRewardAta=new PublicKey(process.env.ISSUER_REWARD_ATA);
 const rewardEscrow=new PublicKey(process.env.REWARD_ESCROW);
 const amount=BigInt(process.env.AMOUNT);
 
-const payer=Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("target/deploy/test-wallet.json","utf8"))));
+const payer=Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("platform-authority.json","utf8"))));
 const tokenProgram=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 (async()=>{

@@ -7,7 +7,7 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction, InstructionError},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::{Transaction, TransactionError},
 };
@@ -36,11 +36,21 @@ async fn send_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_sign
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
-async fn send_expect_custom_err(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, expected_code: u32) {
+async fn send_expect_custom_err(
+    ctx: &mut ProgramTestContext,
+    ixs: Vec<Instruction>,
+    extra_signers: &[&Keypair],
+    expected_code: u32,
+) {
     let payer = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    tx.sign(&[&ctx.payer], bh);
+
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
+    signers.extend_from_slice(extra_signers);
+
+    tx.sign(&signers, bh);
 
     let err = ctx.banks_client.process_transaction(tx).await.unwrap_err();
     match err {
@@ -76,14 +86,8 @@ async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_autho
         &spl_token::id(),
     );
 
-    let init = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
-        &mint_kp.pubkey(),
-        mint_authority,
-        None,
-        0,
-    )
-    .unwrap();
+    let init = spl_token::instruction::initialize_mint(&spl_token::id(), &mint_kp.pubkey(), mint_authority, None, 0)
+        .unwrap();
 
     send_ok(ctx, vec![create, init], &[mint_kp]).await;
 }
@@ -101,27 +105,13 @@ async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, m
         &spl_token::id(),
     );
 
-    let init = spl_token::instruction::initialize_account(
-        &spl_token::id(),
-        &acct_kp.pubkey(),
-        mint,
-        owner,
-    )
-    .unwrap();
+    let init = spl_token::instruction::initialize_account(&spl_token::id(), &acct_kp.pubkey(), mint, owner).unwrap();
 
     send_ok(ctx, vec![create, init], &[acct_kp]).await;
 }
 
 async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
-    let ix = spl_token::instruction::mint_to(
-        &spl_token::id(),
-        mint,
-        dst,
-        &mint_authority.pubkey(),
-        &[],
-        amount,
-    )
-    .unwrap();
+    let ix = spl_token::instruction::mint_to(&spl_token::id(), mint, dst, &mint_authority.pubkey(), &[], amount).unwrap();
     send_ok(ctx, vec![ix], &[mint_authority]).await;
 }
 
@@ -135,7 +125,13 @@ async fn substitute_reward_escrow_rejected_pt() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer_pk = ctx.payer.pubkey();
+
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    let airdrop_ix = system_instruction::transfer(&ctx.payer.pubkey(), &platform.pubkey(), 5_000_000_000);
+    send_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
+    let participant_pk = ctx.payer.pubkey();
 
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
     let now: i64 = (c.slot as i64) / 2;
@@ -146,8 +142,8 @@ async fn substitute_reward_escrow_rejected_pt() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
-    let (user_pda, _) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
+    let (issuance_pda, _) = pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
+    let (user_pda, _) = pda::derive_user_pda(&program_id, &issuance_pda, &participant_pk);
 
     // mints
     let lock_mint = Keypair::new();
@@ -168,26 +164,26 @@ async fn substitute_reward_escrow_rejected_pt() {
 
     // funding + participant
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
 
     let participant_lock = Keypair::new();
-    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &participant_pk).await;
 
     let participant_reward = Keypair::new();
-    create_token_account(&mut ctx, &participant_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &participant_reward, &reward_mint.pubkey(), &participant_pk).await;
 
     let platform_treasury = Keypair::new();
-    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &platform.pubkey()).await;
 
     mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward.pubkey(), &mint_auth, reserve_total as u64).await;
     mint_to(&mut ctx, &lock_mint.pubkey(), &participant_lock.pubkey(), &mint_auth, deposit_amount).await;
 
-    // init
+    // init (signer = PLATFORM)
     let init_ix = mk_ix(
         program_id,
         LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }.try_to_vec().unwrap(),
         vec![
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
@@ -197,23 +193,23 @@ async fn substitute_reward_escrow_rejected_pt() {
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund
+    // fund (signer = PLATFORM)
     let fund_ix = mk_ix(
         program_id,
         LockrionInstruction::FundReserve { amount: reserve_total as u64 }.try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
-    // deposit to ensure user_state exists (claim will fail earlier anyway)
+    // deposit to ensure user_state exists
     warp_to_ts(&mut ctx, start_ts).await;
 
     let deposit_ix = mk_ix(
@@ -222,7 +218,7 @@ async fn substitute_reward_escrow_rejected_pt() {
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_lock.pubkey(), false),
             AccountMeta::new(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -231,24 +227,22 @@ async fn substitute_reward_escrow_rejected_pt() {
     );
     send_ok(&mut ctx, vec![deposit_ix], &[]).await;
 
-    // claim with WRONG reward_escrow (should fail at escrow binding check)
+    // claim must pass time gate -> warp to maturity
+    warp_to_ts(&mut ctx, maturity_ts).await;
+
+    // claim with WRONG reward_escrow
     let claim_ix = mk_ix(
         program_id,
         LockrionInstruction::ClaimReward.try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_reward.pubkey(), false),
-            AccountMeta::new(fake_reward_escrow.pubkey(), false), // WRONG
+            AccountMeta::new(fake_reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
 
-    send_expect_custom_err(
-        &mut ctx,
-        vec![claim_ix],
-        LockrionError::InvalidEscrowAccount as u32,
-    )
-    .await;
+    send_expect_custom_err(&mut ctx, vec![claim_ix], &[], LockrionError::InvalidEscrowAccount as u32).await;
 }

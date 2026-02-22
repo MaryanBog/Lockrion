@@ -6,7 +6,7 @@ const fs = require("fs");
 
 const RPC="http://127.0.0.1:8899";
 const programId = new PublicKey(process.env.PROGRAM_ID);
-const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("target/deploy/test-wallet.json","utf8"))));
+const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("platform-authority.json","utf8"))));
 
 const reserveTotal = BigInt(process.env.RESERVE_TOTAL);
 const startTs = BigInt(process.env.START_TS);

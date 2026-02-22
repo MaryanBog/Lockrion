@@ -1,5 +1,6 @@
+// ==============================
 // tests/043_sweep_zero_participation_rejected_pt.rs
-
+// ==============================
 #![forbid(unsafe_code)]
 
 use borsh::BorshSerialize;
@@ -7,14 +8,12 @@ use solana_program::program_pack::Pack;
 use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
+    instruction::InstructionError,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
-use solana_sdk::instruction::InstructionError;
-use solana_sdk::transaction::TransactionError;
-
 use spl_token::state::{Account as TokenAccount, Mint};
 
 use lockrion_issuance_v1_1::{
@@ -23,16 +22,13 @@ use lockrion_issuance_v1_1::{
     pda,
 };
 
-async fn send_tx_ok(
-    ctx: &mut ProgramTestContext,
-    ixs: Vec<Instruction>,
-    extra_signers: &[&Keypair],
-) {
+async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
 
-    let mut signers: Vec<&Keypair> = vec![&ctx.payer];
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
     signers.extend_from_slice(extra_signers);
 
     tx.sign(&signers, bh);
@@ -48,34 +44,33 @@ async fn send_tx_err(
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
 
-    let mut signers: Vec<&Keypair> = vec![&ctx.payer];
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
     signers.extend_from_slice(extra_signers);
 
     tx.sign(&signers, bh);
 
     match ctx.banks_client.process_transaction(tx).await {
-        Ok(_) => panic!("expected failure"),
+        Ok(_) => panic!("expected transaction failure, but it succeeded"),
         Err(e) => e.unwrap(),
     }
 }
 
 async fn warp_until_ts(ctx: &mut ProgramTestContext, target_ts: i64) {
     loop {
-        let c: solana_sdk::sysvar::clock::Clock =
-            ctx.banks_client.get_sysvar().await.unwrap();
-        if c.unix_timestamp >= target_ts {
+        let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
+        // test-clock model used in your other tests: "time" = slot/2
+        let now: i64 = (c.slot as i64) / 2;
+        if now >= target_ts {
             return;
         }
-        let slot = ctx.banks_client.get_root_slot().await.unwrap();
-        ctx.warp_to_slot(slot + 2000).unwrap();
+        let need = (target_ts - now) as u64;
+        let jump_slots = need.saturating_mul(2);
+        ctx.warp_to_slot(c.slot + jump_slots + 10).unwrap();
     }
 }
 
-async fn create_mint(
-    ctx: &mut ProgramTestContext,
-    mint_kp: &Keypair,
-    mint_authority: &Pubkey,
-) {
+async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_authority: &Pubkey) {
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let space = Mint::LEN;
     let lamports = rent.minimum_balance(space);
@@ -100,12 +95,7 @@ async fn create_mint(
     send_tx_ok(ctx, vec![create, init], &[mint_kp]).await;
 }
 
-async fn create_token_account(
-    ctx: &mut ProgramTestContext,
-    acct_kp: &Keypair,
-    mint: &Pubkey,
-    owner: &Pubkey,
-) {
+async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, mint: &Pubkey, owner: &Pubkey) {
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let space = TokenAccount::LEN;
     let lamports = rent.minimum_balance(space);
@@ -125,13 +115,7 @@ async fn create_token_account(
     send_tx_ok(ctx, vec![create, init], &[acct_kp]).await;
 }
 
-async fn mint_to(
-    ctx: &mut ProgramTestContext,
-    mint: &Pubkey,
-    dst: &Pubkey,
-    mint_authority: &Keypair,
-    amount: u64,
-) {
+async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
     let ix = spl_token::instruction::mint_to(
         &spl_token::id(),
         mint,
@@ -143,6 +127,12 @@ async fn mint_to(
     .unwrap();
 
     send_tx_ok(ctx, vec![ix], &[mint_authority]).await;
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, token_acc: &Pubkey) -> u64 {
+    let acc = ctx.banks_client.get_account(*token_acc).await.unwrap().unwrap();
+    let ta = TokenAccount::unpack_from_slice(&acc.data).unwrap();
+    ta.amount
 }
 
 fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruction {
@@ -160,19 +150,36 @@ async fn sweep_zero_participation_rejected_pt() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer = ctx.payer.pubkey();
 
-    let c: solana_sdk::sysvar::clock::Clock =
-        ctx.banks_client.get_sysvar().await.unwrap();
-    let now = (c.slot as i64) / 2;
+    // -----------------------------
+    // PLATFORM-CONTROLLED ISSUANCE
+    // -----------------------------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+    let platform_pk = platform.pubkey();
+
+    // participant stays ctx.payer (DO NOT change)
+    let participant_pk = ctx.payer.pubkey();
+
+    // give platform lamports
+    let airdrop_ix = system_instruction::transfer(&participant_pk, &platform_pk, 5_000_000_000);
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
+    // -------- params --------
+    let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let now: i64 = (c.slot as i64) / 2;
 
     let reserve_total: u128 = 1000;
-    let start_ts = now + 10;
-    let maturity_ts = start_ts + 86400;
+    let start_ts: i64 = now + 10;
+    let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _) =
-        pda::derive_issuance_pda(&program_id, &payer, start_ts, reserve_total);
+    let claim_window: i64 = 90 * 86_400;
+    let sweep_start: i64 = maturity_ts + claim_window;
 
+    // ✅ issuance PDA derived from PLATFORM
+    let (issuance_pda, _bump) =
+        pda::derive_issuance_pda(&program_id, &platform_pk, start_ts, reserve_total);
+
+    // -------- mints --------
     let lock_mint = Keypair::new();
     let reward_mint = Keypair::new();
     let mint_auth = Keypair::new();
@@ -180,15 +187,20 @@ async fn sweep_zero_participation_rejected_pt() {
     create_mint(&mut ctx, &lock_mint, &mint_auth.pubkey()).await;
     create_mint(&mut ctx, &reward_mint, &mint_auth.pubkey()).await;
 
+    // -------- escrows (owned by issuance PDA) --------
     let deposit_escrow = Keypair::new();
     let reward_escrow = Keypair::new();
-
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
     create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
+    // -------- platform accounts --------
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform_pk).await;
 
+    let platform_treasury = Keypair::new();
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &platform_pk).await;
+
+    // mint & fund reserve so sweep has something to move
     mint_to(
         &mut ctx,
         &reward_mint.pubkey(),
@@ -198,73 +210,76 @@ async fn sweep_zero_participation_rejected_pt() {
     )
     .await;
 
-    let init_data = LockrionInstruction::InitIssuance {
-        reserve_total,
-        start_ts,
-        maturity_ts,
-    }
-    .try_to_vec()
-    .unwrap();
-
+    // -------- init_issuance (signer = PLATFORM) --------
     let init_ix = mk_ix(
         program_id,
-        init_data,
+        LockrionInstruction::InitIssuance {
+            reserve_total,
+            start_ts,
+            maturity_ts,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
-            AccountMeta::new(payer, true),
+            AccountMeta::new(platform_pk, true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer, false),
+            AccountMeta::new_readonly(platform_treasury.pubkey(), false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    let fund_data = LockrionInstruction::FundReserve {
-        amount: reserve_total as u64,
-    }
-    .try_to_vec()
-    .unwrap();
-
+    // -------- fund_reserve before start_ts (signer = PLATFORM) --------
     let fund_ix = mk_ix(
         program_id,
-        fund_data,
+        LockrionInstruction::FundReserve {
+            amount: reserve_total as u64,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer, true),
+            AccountMeta::new(platform_pk, true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
-    warp_until_ts(&mut ctx, maturity_ts + 1).await;
+    // -------- ensure escrow funded --------
+    let escrow_bal = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
+    assert!(escrow_bal > 0, "reward escrow must be funded for sweep test");
 
-    let sweep_data = LockrionInstruction::Sweep.try_to_vec().unwrap();
+    // -------- ZERO PARTICIPATION scenario: no deposits at all --------
+    // move to sweep_start (claim window end)
+    warp_until_ts(&mut ctx, sweep_start).await;
 
+    // Attempt sweep should be rejected because total_weight_accum == 0 (zero participation)
     let sweep_ix = mk_ix(
         program_id,
-        sweep_data,
+        LockrionInstruction::Sweep.try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer, true),
             AccountMeta::new(reward_escrow.pubkey(), false),
-            AccountMeta::new(issuer_reward.pubkey(), false),
+            AccountMeta::new(platform_treasury.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
 
     let err = send_tx_err(&mut ctx, vec![sweep_ix], &[]).await;
 
-    let expected = 0x34; // фактический custom error из лога
+    // Expected: NoParticipation (this is the contract's sweep gate for zero participation)
+    let expected = LockrionError::NoParticipation as u32;
 
     match err {
-        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, expected);
+        TransactionError::InstructionError(_idx, InstructionError::Custom(code)) => {
+            assert_eq!(code, expected, "unexpected custom error code");
         }
-        _ => panic!("unexpected error"),
+        other => panic!("unexpected transaction error: {other:?}"),
     }
 }

@@ -7,16 +7,13 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::Transaction,
 };
 use spl_token::state::{Account as TokenAccount, Mint};
 
-use lockrion_issuance_v1_1::{
-    instruction::LockrionInstruction,
-    pda,
-};
+use lockrion_issuance_v1_1::{instruction::LockrionInstruction, pda};
 
 async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
@@ -59,14 +56,9 @@ async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_autho
         &spl_token::id(),
     );
 
-    let init = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
-        &mint_kp.pubkey(),
-        mint_authority,
-        None,
-        decimals,
-    )
-    .unwrap();
+    let init =
+        spl_token::instruction::initialize_mint(&spl_token::id(), &mint_kp.pubkey(), mint_authority, None, decimals)
+            .unwrap();
 
     send_tx_ok(ctx, vec![create, init], &[mint_kp]).await;
 }
@@ -91,16 +83,7 @@ async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, m
 }
 
 async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
-    let ix = spl_token::instruction::mint_to(
-        &spl_token::id(),
-        mint,
-        dst,
-        &mint_authority.pubkey(),
-        &[],
-        amount,
-    )
-    .unwrap();
-
+    let ix = spl_token::instruction::mint_to(&spl_token::id(), mint, dst, &mint_authority.pubkey(), &[], amount).unwrap();
     send_tx_ok(ctx, vec![ix], &[mint_authority]).await;
 }
 
@@ -125,7 +108,13 @@ async fn zero_participation_reclaim_happy_program_test() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer_pk = ctx.payer.pubkey();
+
+    // -------- PLATFORM --------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // дать platform лампорты
+    let airdrop_ix = system_instruction::transfer(&ctx.payer.pubkey(), &platform.pubkey(), 5_000_000_000);
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
 
     // now matches feature test-clock: slot/2
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -137,7 +126,8 @@ async fn zero_participation_reclaim_happy_program_test() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+    // issuance PDA от PLATFORM
+    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
 
     // mints
     let reward_mint = Keypair::new();
@@ -154,14 +144,14 @@ async fn zero_participation_reclaim_happy_program_test() {
     let deposit_escrow = Keypair::new();
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
 
-    // issuer reward token account (for initial mint + reclaim destination)
+    // issuer reward token account (owner = PLATFORM) for initial mint + reclaim destination
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
 
     // mint reserve into issuer reward, then fund reserve into escrow
     mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward.pubkey(), &mint_auth, reserve_total as u64).await;
 
-    // init_issuance (platform_treasury = payer_pk OK, reclaim doesn't validate it)
+    // init_issuance (signer = PLATFORM)
     let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
         .try_to_vec()
         .unwrap();
@@ -170,19 +160,19 @@ async fn zero_participation_reclaim_happy_program_test() {
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false), // platform_treasury
+            AccountMeta::new_readonly(platform.pubkey(), false), // platform_treasury
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund_reserve before start_ts
+    // fund_reserve before start_ts (signer = PLATFORM)
     let fund_ix = mk_ix(
         program_id,
         LockrionInstruction::FundReserve { amount: reserve_total as u64 }
@@ -190,13 +180,13 @@ async fn zero_participation_reclaim_happy_program_test() {
             .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
     // warp to maturity
     warp_until_ts(&mut ctx, maturity_ts).await;
@@ -211,13 +201,13 @@ async fn zero_participation_reclaim_happy_program_test() {
         LockrionInstruction::ZeroParticipationReclaim.try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![reclaim_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![reclaim_ix], &[&platform]).await;
 
     let issuer_after = token_balance(&mut ctx, &issuer_reward.pubkey()).await;
     let escrow_after = token_balance(&mut ctx, &reward_escrow.pubkey()).await;

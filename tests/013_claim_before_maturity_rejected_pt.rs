@@ -19,6 +19,8 @@ use lockrion_issuance_v1_1::{
     pda,
 };
 
+use solana_sdk::signature::read_keypair_file;
+
 async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
@@ -148,6 +150,19 @@ async fn claim_before_maturity_rejected_program_test() {
     );
 
     let mut ctx = pt.start_with_context().await;
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+    println!("platform pubkey = {}", platform.pubkey());
+    
+
+    // дать платформе лампорты
+let airdrop_ix = system_instruction::transfer(
+    &ctx.payer.pubkey(),
+    &platform.pubkey(),
+    5_000_000_000,
+);
+
+send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
     let payer_pk = ctx.payer.pubkey();
 
     // now must match feature test-clock: slot/2
@@ -160,7 +175,8 @@ async fn claim_before_maturity_rejected_program_test() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+    let (issuance_pda, _bump) =
+    pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
     let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
 
     // mints
@@ -178,7 +194,12 @@ async fn claim_before_maturity_rejected_program_test() {
 
     // user token accounts
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(
+        &mut ctx,
+        &issuer_reward,
+        &reward_mint.pubkey(),
+        &platform.pubkey(),
+    ).await;
 
     let participant_lock = Keypair::new();
     create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &payer_pk).await;
@@ -196,38 +217,39 @@ async fn claim_before_maturity_rejected_program_test() {
         .unwrap();
 
     let init_ix = mk_ix(
-        program_id,
-        init_data,
-        vec![
-            AccountMeta::new(payer_pk, true),
-            AccountMeta::new(issuance_pda, false),
-            AccountMeta::new_readonly(lock_mint.pubkey(), false),
-            AccountMeta::new_readonly(reward_mint.pubkey(), false),
-            AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
-            AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false), // platform_treasury
-            AccountMeta::new_readonly(system_program::id(), false),
-        ],
+            program_id,
+            init_data,
+            vec![
+                AccountMeta::new(platform.pubkey(), true),
+                AccountMeta::new(issuance_pda, false),
+                AccountMeta::new_readonly(lock_mint.pubkey(), false),
+                AccountMeta::new_readonly(reward_mint.pubkey(), false),
+                AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
+                AccountMeta::new_readonly(reward_escrow.pubkey(), false),
+                AccountMeta::new_readonly(payer_pk, false),
+                AccountMeta::new_readonly(solana_program::system_program::id(), false),
+            ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
     // fund_reserve (before start_ts)
     let fund_data = LockrionInstruction::FundReserve { amount: reserve_total as u64 }
         .try_to_vec()
         .unwrap();
 
-    let fund_ix = mk_ix(
-        program_id,
-        fund_data,
-        vec![
-            AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
-            AccountMeta::new(issuer_reward.pubkey(), false),
-            AccountMeta::new(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-        ],
-    );
-    send_tx_ok(&mut ctx, vec![fund_ix], &[]).await;
+        let fund_ix = mk_ix(
+            program_id,
+            fund_data,
+            vec![
+                AccountMeta::new(issuance_pda, false),
+                AccountMeta::new(platform.pubkey(), true),
+                AccountMeta::new(issuer_reward.pubkey(), false),
+                AccountMeta::new(reward_escrow.pubkey(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+            ],
+        );
+        
+        send_tx_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
     // deposit (after start_ts)
     warp_until_ts(&mut ctx, start_ts).await;
@@ -236,19 +258,19 @@ async fn claim_before_maturity_rejected_program_test() {
         .try_to_vec()
         .unwrap();
 
-    let dep_ix = mk_ix(
-        program_id,
-        dep_data,
-        vec![
-            AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
-            AccountMeta::new(participant_lock.pubkey(), false),
-            AccountMeta::new(deposit_escrow.pubkey(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-        ],
-    );
+        let dep_ix = mk_ix(
+            program_id,
+            dep_data,
+            vec![
+                AccountMeta::new(issuance_pda, false),
+                AccountMeta::new(user_pda, false),
+                AccountMeta::new(payer_pk, true),
+                AccountMeta::new(participant_lock.pubkey(), false),
+                AccountMeta::new(deposit_escrow.pubkey(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+        );
     send_tx_ok(&mut ctx, vec![dep_ix], &[]).await;
 
     // claim BEFORE maturity must fail with ClaimWindowNotStarted (30)

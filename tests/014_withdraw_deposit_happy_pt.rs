@@ -18,6 +18,8 @@ use lockrion_issuance_v1_1::{
     pda,
 };
 
+use solana_sdk::signature::read_keypair_file;
+
 async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
@@ -125,7 +127,19 @@ async fn withdraw_deposit_happy_program_test() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer_pk = ctx.payer.pubkey();
+
+    // -------- PLATFORM --------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // дать platform лампорты
+    let airdrop_ix = system_instruction::transfer(
+        &ctx.payer.pubkey(),
+        &platform.pubkey(),
+        5_000_000_000,
+    );
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
+    let participant_pk = ctx.payer.pubkey();
 
     // "now" matches feature test-clock: slot/2
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -137,8 +151,12 @@ async fn withdraw_deposit_happy_program_test() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400; // must be > start_ts
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
-    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
+    // issuance PDA от PLATFORM
+    let (issuance_pda, _bump) =
+        pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
+
+    // user PDA от PARTICIPANT
+    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &participant_pk);
 
     // mints
     let lock_mint = Keypair::new();
@@ -153,18 +171,19 @@ async fn withdraw_deposit_happy_program_test() {
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
     create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
-    // user token accounts
+    // issuer token account (owner = PLATFORM)
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
 
+    // participant token account
     let participant_lock = Keypair::new();
-    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &participant_pk).await;
 
     // mint balances
     mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward.pubkey(), &mint_auth, reserve_total as u64).await;
     mint_to(&mut ctx, &lock_mint.pubkey(), &participant_lock.pubkey(), &mint_auth, deposit_amount).await;
 
-    // init_issuance
+    // init_issuance (signer = PLATFORM)
     let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
         .try_to_vec()
         .unwrap();
@@ -173,19 +192,19 @@ async fn withdraw_deposit_happy_program_test() {
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false), // platform_treasury
+            AccountMeta::new_readonly(platform.pubkey(), false), // platform_treasury
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund_reserve (before start_ts)
+    // fund_reserve (before start_ts) signer = PLATFORM
     let fund_data = LockrionInstruction::FundReserve { amount: reserve_total as u64 }
         .try_to_vec()
         .unwrap();
@@ -195,15 +214,15 @@ async fn withdraw_deposit_happy_program_test() {
         fund_data,
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
-    // deposit (after start_ts)
+    // deposit (after start_ts) signer = PARTICIPANT
     warp_until_ts(&mut ctx, start_ts).await;
 
     let dep_data = LockrionInstruction::Deposit { amount: deposit_amount }
@@ -216,7 +235,7 @@ async fn withdraw_deposit_happy_program_test() {
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_lock.pubkey(), false),
             AccountMeta::new(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -236,7 +255,7 @@ async fn withdraw_deposit_happy_program_test() {
     assert_eq!(participant_after_dep + deposit_amount, participant_before);
     assert_eq!(escrow_after_dep, escrow_before + deposit_amount);
 
-    // withdraw_deposit after maturity
+    // withdraw_deposit after maturity (signer = PARTICIPANT)
     warp_until_ts(&mut ctx, maturity_ts).await;
 
     let wd_data = LockrionInstruction::WithdrawDeposit.try_to_vec().unwrap();
@@ -247,7 +266,7 @@ async fn withdraw_deposit_happy_program_test() {
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_lock.pubkey(), false),
             AccountMeta::new(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),

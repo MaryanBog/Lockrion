@@ -7,7 +7,7 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction, InstructionError},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::{Transaction, TransactionError},
 };
@@ -36,11 +36,16 @@ async fn send_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_sign
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
-async fn send_expect_custom_err(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, expected_code: u32) {
+async fn send_expect_custom_err(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair], expected_code: u32) {
     let payer = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    tx.sign(&[&ctx.payer], bh);
+
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
+    signers.extend_from_slice(extra_signers);
+
+    tx.sign(&signers, bh);
 
     let err = ctx.banks_client.process_transaction(tx).await.unwrap_err();
 
@@ -144,7 +149,13 @@ async fn reclaim_double_rejected_pt() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer_pk = ctx.payer.pubkey();
+
+    // -------- PLATFORM --------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // дать platform лампорты
+    let airdrop_ix = system_instruction::transfer(&ctx.payer.pubkey(), &platform.pubkey(), 5_000_000_000);
+    send_ok(&mut ctx, vec![airdrop_ix], &[]).await;
 
     // now (feature test-clock uses slot/2)
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -154,7 +165,8 @@ async fn reclaim_double_rejected_pt() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+    // issuance PDA от PLATFORM
+    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
 
     // mints
     let lock_mint = Keypair::new();
@@ -169,24 +181,24 @@ async fn reclaim_double_rejected_pt() {
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
     create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
-    // issuer reward account (funding source + reclaim destination)
+    // issuer reward account (funding source + reclaim destination) owner = PLATFORM
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
 
-    // platform treasury (required by init, reward mint)
+    // platform treasury (required by init, reward mint) owner = PLATFORM
     let platform_treasury = Keypair::new();
-    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &platform.pubkey()).await;
 
     // fund source balance
     mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward.pubkey(), &mint_auth, reserve_total as u64).await;
 
-    // init issuance
+    // init issuance (signer = PLATFORM)
     let init_ix = mk_ix(
         program_id,
         LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
             .try_to_vec().unwrap(),
         vec![
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
@@ -196,46 +208,47 @@ async fn reclaim_double_rejected_pt() {
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund reserve (must be before start_ts)
+    // fund reserve (must be before start_ts) signer = PLATFORM
     let fund_ix = mk_ix(
         program_id,
         LockrionInstruction::FundReserve { amount: reserve_total as u64 }
             .try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
     // NO deposits -> zero participation
 
     // warp to maturity (reclaim allowed)
     warp_to_ts(&mut ctx, maturity_ts).await;
 
-    // first reclaim OK
+    // first reclaim OK (signer = PLATFORM)
     let reclaim_ix = mk_ix(
         program_id,
         LockrionInstruction::ZeroParticipationReclaim.try_to_vec().unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true), // issuer signer
+            AccountMeta::new(platform.pubkey(), true), // issuer signer
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_ok(&mut ctx, vec![reclaim_ix.clone()], &[]).await;
+    send_ok(&mut ctx, vec![reclaim_ix.clone()], &[&platform]).await;
 
-    // second reclaim must fail with ReclaimAlreadyExecuted (41)
+    // second reclaim must fail
     send_expect_custom_err(
         &mut ctx,
         vec![reclaim_ix],
+        &[&platform],
         LockrionError::ReclaimAlreadyExecuted as u32,
     )
     .await;

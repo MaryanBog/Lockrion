@@ -1,3 +1,6 @@
+// ==============================
+// tests/041_fund_reserve_non_issuer_rejected_pt.rs
+// ==============================
 #![forbid(unsafe_code)]
 
 use borsh::BorshSerialize;
@@ -5,14 +8,12 @@ use solana_program::program_pack::Pack;
 use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
+    instruction::InstructionError,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
-use solana_sdk::transaction::TransactionError;
-use solana_sdk::instruction::InstructionError;
-
 use spl_token::state::{Account as TokenAccount, Mint};
 
 use lockrion_issuance_v1_1::{
@@ -22,11 +23,7 @@ use lockrion_issuance_v1_1::{
     state::IssuanceState,
 };
 
-async fn send_tx_ok(
-    ctx: &mut ProgramTestContext,
-    ixs: Vec<Instruction>,
-    extra_signers: &[&Keypair],
-) {
+async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -60,12 +57,7 @@ async fn send_tx_err(
     }
 }
 
-async fn create_mint(
-    ctx: &mut ProgramTestContext,
-    mint_kp: &Keypair,
-    mint_authority: &Pubkey,
-    decimals: u8,
-) {
+async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_authority: &Pubkey, decimals: u8) {
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let space = Mint::LEN;
     let lamports = rent.minimum_balance(space);
@@ -90,12 +82,7 @@ async fn create_mint(
     send_tx_ok(ctx, vec![create, init], &[mint_kp]).await;
 }
 
-async fn create_token_account(
-    ctx: &mut ProgramTestContext,
-    acct_kp: &Keypair,
-    mint: &Pubkey,
-    owner: &Pubkey,
-) {
+async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, mint: &Pubkey, owner: &Pubkey) {
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let space = TokenAccount::LEN;
     let lamports = rent.minimum_balance(space);
@@ -115,13 +102,7 @@ async fn create_token_account(
     send_tx_ok(ctx, vec![create, init], &[acct_kp]).await;
 }
 
-async fn mint_to(
-    ctx: &mut ProgramTestContext,
-    mint: &Pubkey,
-    dst: &Pubkey,
-    mint_authority: &Keypair,
-    amount: u64,
-) {
+async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
     let ix = spl_token::instruction::mint_to(
         &spl_token::id(),
         mint,
@@ -142,7 +123,11 @@ async fn token_balance(ctx: &mut ProgramTestContext, token_acc: &Pubkey) -> u64 
 }
 
 fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruction {
-    Instruction { program_id, accounts: metas, data }
+    Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    }
 }
 
 #[tokio::test]
@@ -158,19 +143,28 @@ async fn fund_reserve_non_issuer_rejected_pt() {
     let mut ctx = pt.start_with_context().await;
     let payer_pk = ctx.payer.pubkey();
 
+    // -----------------------------
+    // PLATFORM-CONTROLLED ISSUANCE
+    // -----------------------------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+    let platform_pk = platform.pubkey();
+
+    // give platform lamports (not strictly required for signing here, but matches the model)
+    let airdrop_ix = system_instruction::transfer(&payer_pk, &platform_pk, 5_000_000_000);
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
     // -------- params --------
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
     let now: i64 = (c.slot as i64) / 2;
 
     let reserve_total: u128 = 1000;
 
-    // fund_reserve требует now < start_ts
+    // fund_reserve requires now < start_ts
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    // -------- issuance PDA (issuer = payer) --------
-    let (issuance_pda, _bump) =
-        pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+    // ✅ issuance PDA derived from PLATFORM (issuer = platform)
+    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &platform_pk, start_ts, reserve_total);
 
     // -------- mints --------
     let lock_mint = Keypair::new();
@@ -180,12 +174,29 @@ async fn fund_reserve_non_issuer_rejected_pt() {
     create_mint(&mut ctx, &lock_mint, &mint_auth.pubkey(), 0).await;
     create_mint(&mut ctx, &reward_mint, &mint_auth.pubkey(), 0).await;
 
-    // -------- token accounts --------
+    // -------- escrow accounts (owned by issuance PDA) --------
     let deposit_escrow = Keypair::new();
-    let reward_escrow  = Keypair::new();
+    let reward_escrow = Keypair::new();
 
-    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(),  &issuance_pda).await;
-    create_token_account(&mut ctx, &reward_escrow,  &reward_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
+
+    // -------- platform accounts --------
+    let issuer_reward = Keypair::new();
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform_pk).await;
+
+    let platform_treasury = Keypair::new();
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &platform_pk).await;
+
+    // mint issuer reward balance (not actually used in the attack, but makes state realistic)
+    mint_to(
+        &mut ctx,
+        &reward_mint.pubkey(),
+        &issuer_reward.pubkey(),
+        &mint_auth,
+        reserve_total as u64,
+    )
+    .await;
 
     // -------- attacker (non-issuer) --------
     let attacker = Keypair::new();
@@ -194,6 +205,7 @@ async fn fund_reserve_non_issuer_rejected_pt() {
     let attacker_reward = Keypair::new();
     create_token_account(&mut ctx, &attacker_reward, &reward_mint.pubkey(), &attacker.pubkey()).await;
 
+    // mint rewards to attacker so "insufficient funds" is NOT the reason for failure
     mint_to(
         &mut ctx,
         &reward_mint.pubkey(),
@@ -203,39 +215,45 @@ async fn fund_reserve_non_issuer_rejected_pt() {
     )
     .await;
 
-    // -------- init_issuance --------
-    let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
-        .try_to_vec()
-        .unwrap();
+    // -------- init_issuance (signer PLATFORM) --------
+    let init_data = LockrionInstruction::InitIssuance {
+        reserve_total,
+        start_ts,
+        maturity_ts,
+    }
+    .try_to_vec()
+    .unwrap();
 
     let init_ix = mk_ix(
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),                 // payer (and issuer for this issuance)
+            AccountMeta::new(platform_pk, true), // ✅ platform signer / issuer
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false),       // platform_treasury
+            AccountMeta::new_readonly(platform_treasury.pubkey(), false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // -------- fund_reserve by NON-ISSUER --------
-    let fund_data = LockrionInstruction::FundReserve { amount: reserve_total as u64 }
-        .try_to_vec()
-        .unwrap();
+    // -------- fund_reserve by NON-ISSUER (attacker) --------
+    let fund_data = LockrionInstruction::FundReserve {
+        amount: reserve_total as u64,
+    }
+    .try_to_vec()
+    .unwrap();
 
     let fund_ix = mk_ix(
         program_id,
         fund_data,
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(attacker.pubkey(), true),            // <- non-issuer signer
-            AccountMeta::new(attacker_reward.pubkey(), false),    // source owned by attacker
+            AccountMeta::new(attacker.pubkey(), true),         // <- non-issuer signer
+            AccountMeta::new(attacker_reward.pubkey(), false), // source owned by attacker
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],

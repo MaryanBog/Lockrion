@@ -6,12 +6,12 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::Transaction,
 };
-use solana_sdk::transaction::TransactionError;
 use solana_sdk::instruction::InstructionError;
+use solana_sdk::transaction::TransactionError;
 
 use spl_token::state::{Account as TokenAccount, Mint};
 
@@ -142,7 +142,11 @@ async fn token_balance(ctx: &mut ProgramTestContext, token_acc: &Pubkey) -> u64 
 }
 
 fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruction {
-    Instruction { program_id, accounts: metas, data }
+    Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    }
 }
 
 #[tokio::test]
@@ -156,7 +160,20 @@ async fn fund_reserve_wrong_amount_rejected_pt() {
     );
 
     let mut ctx = pt.start_with_context().await;
+
+    // ✅ platform authority (issuer)
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // ✅ give platform lamports for fees
+    let airdrop_ix = system_instruction::transfer(
+        &ctx.payer.pubkey(),
+        &platform.pubkey(),
+        5_000_000_000,
+    );
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
     let payer_pk = ctx.payer.pubkey();
+    let issuer_pk = platform.pubkey();
 
     // -------- params --------
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -165,13 +182,13 @@ async fn fund_reserve_wrong_amount_rejected_pt() {
     let reserve_total: u128 = 1000;
     let wrong_amount: u64 = (reserve_total as u64).saturating_sub(1);
 
-    // fund_reserve требует now < start_ts
+    // fund_reserve requires now < start_ts
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    // -------- issuance PDA --------
+    // ✅ issuance PDA derived from PLATFORM
     let (issuance_pda, _bump) =
-        pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+        pda::derive_issuance_pda(&program_id, &issuer_pk, start_ts, reserve_total);
 
     // -------- mints --------
     let lock_mint = Keypair::new();
@@ -183,13 +200,14 @@ async fn fund_reserve_wrong_amount_rejected_pt() {
 
     // -------- token accounts --------
     let deposit_escrow = Keypair::new();
-    let reward_escrow  = Keypair::new();
+    let reward_escrow = Keypair::new();
 
-    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(),  &issuance_pda).await;
-    create_token_account(&mut ctx, &reward_escrow,  &reward_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    // ✅ issuer_reward must be owned by PLATFORM
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &issuer_pk).await;
 
     // mint issuer reward balance (enough to fund even the correct amount)
     mint_to(
@@ -201,28 +219,32 @@ async fn fund_reserve_wrong_amount_rejected_pt() {
     )
     .await;
 
-    // -------- init_issuance --------
-    let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
-        .try_to_vec()
-        .unwrap();
+    // -------- init_issuance (signer PLATFORM) --------
+    let init_data = LockrionInstruction::InitIssuance {
+        reserve_total,
+        start_ts,
+        maturity_ts,
+    }
+    .try_to_vec()
+    .unwrap();
 
     let init_ix = mk_ix(
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),                 // payer
-            AccountMeta::new(issuance_pda, false),            // issuance PDA
+            AccountMeta::new(issuer_pk, true), // ✅ platform signer
+            AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false),       // platform_treasury
+            AccountMeta::new_readonly(payer_pk, false), // platform_treasury (ok for this test)
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // -------- fund_reserve (WRONG amount) --------
+    // -------- fund_reserve (WRONG amount, signer PLATFORM) --------
     let fund_data = LockrionInstruction::FundReserve { amount: wrong_amount }
         .try_to_vec()
         .unwrap();
@@ -232,21 +254,24 @@ async fn fund_reserve_wrong_amount_rejected_pt() {
         fund_data,
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),                 // issuer signer
-            AccountMeta::new(issuer_reward.pubkey(), false),  // issuer reward token acc
-            AccountMeta::new(reward_escrow.pubkey(), false),  // reward escrow
+            AccountMeta::new(issuer_pk, true),                // ✅ platform signer
+            AccountMeta::new(issuer_reward.pubkey(), false),
+            AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
 
-    let err = send_tx_err(&mut ctx, vec![fund_ix], &[]).await;
+    let err = send_tx_err(&mut ctx, vec![fund_ix], &[&platform]).await;
 
     // Expect: InvalidFundingAmount
     let expected_code = LockrionError::InvalidFundingAmount as u32;
 
     match err {
         TransactionError::InstructionError(_idx, InstructionError::Custom(code)) => {
-            assert_eq!(code, expected_code, "unexpected custom error code: got={code} expected={expected_code}");
+            assert_eq!(
+                code, expected_code,
+                "unexpected custom error code: got={code} expected={expected_code}"
+            );
         }
         other => panic!("unexpected transaction error: {other:?}"),
     }

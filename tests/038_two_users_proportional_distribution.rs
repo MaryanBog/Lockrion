@@ -9,7 +9,7 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::Transaction,
 };
@@ -58,11 +58,23 @@ async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_autho
         Mint::LEN as u64,
         &spl_token::id(),
     );
-    let init = spl_token::instruction::initialize_mint(&spl_token::id(), &mint_kp.pubkey(), mint_authority, None, 0).unwrap();
+    let init = spl_token::instruction::initialize_mint(
+        &spl_token::id(),
+        &mint_kp.pubkey(),
+        mint_authority,
+        None,
+        0,
+    )
+    .unwrap();
     send_tx(ctx, vec![create, init], &[mint_kp]).await;
 }
 
-async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, mint: &Pubkey, owner: &Pubkey) {
+async fn create_token_account(
+    ctx: &mut ProgramTestContext,
+    acct_kp: &Keypair,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) {
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let lamports = rent.minimum_balance(TokenAccount::LEN);
 
@@ -73,12 +85,28 @@ async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, m
         TokenAccount::LEN as u64,
         &spl_token::id(),
     );
-    let init = spl_token::instruction::initialize_account(&spl_token::id(), &acct_kp.pubkey(), mint, owner).unwrap();
+    let init =
+        spl_token::instruction::initialize_account(&spl_token::id(), &acct_kp.pubkey(), mint, owner)
+            .unwrap();
     send_tx(ctx, vec![create, init], &[acct_kp]).await;
 }
 
-async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
-    let ix = spl_token::instruction::mint_to(&spl_token::id(), mint, dst, &mint_authority.pubkey(), &[], amount).unwrap();
+async fn mint_to(
+    ctx: &mut ProgramTestContext,
+    mint: &Pubkey,
+    dst: &Pubkey,
+    mint_authority: &Keypair,
+    amount: u64,
+) {
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::id(),
+        mint,
+        dst,
+        &mint_authority.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
     send_tx(ctx, vec![ix], &[mint_authority]).await;
 }
 
@@ -88,7 +116,11 @@ async fn token_balance(ctx: &mut ProgramTestContext, token_acc: &Pubkey) -> u64 
 }
 
 fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruction {
-    Instruction { program_id, accounts: metas, data }
+    Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    }
 }
 
 #[tokio::test]
@@ -101,13 +133,26 @@ async fn two_users_proportional_distribution() {
     );
     let mut ctx = pt.start_with_context().await;
 
-    let issuer_pk = ctx.payer.pubkey();
+    // ✅ platform authority
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // ✅ give platform lamports
+    let airdrop_ix = system_instruction::transfer(
+        &ctx.payer.pubkey(),
+        &platform.pubkey(),
+        5_000_000_000,
+    );
+    send_tx(&mut ctx, vec![airdrop_ix], &[]).await;
+
+    let issuer_pk = platform.pubkey();
 
     let start_ts: i64 = 10;
     let maturity_ts: i64 = start_ts + 86_400;
     let reserve_total: u128 = 1000;
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &issuer_pk, start_ts, reserve_total);
+    // ✅ issuance PDA derived from PLATFORM
+    let (issuance_pda, _bump) =
+        pda::derive_issuance_pda(&program_id, &issuer_pk, start_ts, reserve_total);
 
     let lock_mint = Keypair::new();
     let reward_mint = Keypair::new();
@@ -128,12 +173,25 @@ async fn two_users_proportional_distribution() {
     create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &issuer_pk).await;
 
     // mint reward to issuer then fund reserve
-    mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward_ata.pubkey(), &mint_auth, reserve_total as u64).await;
+    mint_to(
+        &mut ctx,
+        &reward_mint.pubkey(),
+        &issuer_reward_ata.pubkey(),
+        &mint_auth,
+        reserve_total as u64,
+    )
+    .await;
 
-    // init
+    // init (signer PLATFORM)
     let init_ix = mk_ix(
         program_id,
-        LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }.try_to_vec().unwrap(),
+        LockrionInstruction::InitIssuance {
+            reserve_total,
+            start_ts,
+            maturity_ts,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
             AccountMeta::new(issuer_pk, true),
             AccountMeta::new(issuance_pda, false),
@@ -145,13 +203,17 @@ async fn two_users_proportional_distribution() {
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx(&mut ctx, vec![init_ix], &[]).await;
+    send_tx(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund before start
+    // fund before start (signer PLATFORM)
     warp_until_ts(&mut ctx, start_ts - 1).await;
     let fund_ix = mk_ix(
         program_id,
-        LockrionInstruction::FundReserve { amount: reserve_total as u64 }.try_to_vec().unwrap(),
+        LockrionInstruction::FundReserve {
+            amount: reserve_total as u64,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(issuer_pk, true),
@@ -160,7 +222,7 @@ async fn two_users_proportional_distribution() {
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx(&mut ctx, vec![fund_ix], &[&platform]).await;
 
     // two users
     let u1 = Keypair::new();
@@ -191,7 +253,9 @@ async fn two_users_proportional_distribution() {
 
     let dep1_ix = mk_ix(
         program_id,
-        LockrionInstruction::Deposit { amount: amt1 }.try_to_vec().unwrap(),
+        LockrionInstruction::Deposit { amount: amt1 }
+            .try_to_vec()
+            .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(u1_pda, false),
@@ -206,7 +270,9 @@ async fn two_users_proportional_distribution() {
 
     let dep2_ix = mk_ix(
         program_id,
-        LockrionInstruction::Deposit { amount: amt2 }.try_to_vec().unwrap(),
+        LockrionInstruction::Deposit { amount: amt2 }
+            .try_to_vec()
+            .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(u2_pda, false),

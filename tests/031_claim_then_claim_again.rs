@@ -2,23 +2,23 @@
 
 use borsh::BorshSerialize;
 use solana_program::program_pack::Pack;
-use solana_program_test::*;
+use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 use spl_token::state::{Account as TokenAccount, Mint};
 
-use lockrion_issuance_v1_1::{instruction::LockrionInstruction, pda};
+use lockrion_issuance_v1_1::{
+    error::LockrionError,
+    instruction::LockrionInstruction,
+    pda,
+};
 
-async fn send_tx(
-    ctx: &mut ProgramTestContext,
-    ixs: Vec<Instruction>,
-    extra_signers: &[&Keypair],
-) {
+async fn send_tx(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
     let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -46,6 +46,37 @@ async fn try_tx(
 
     tx.sign(&signers, bh);
     ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_expect_custom(
+    ctx: &mut ProgramTestContext,
+    ixs: Vec<Instruction>,
+    extra_signers: &[&Keypair],
+) -> u32 {
+    let payer_pk = ctx.payer.pubkey();
+    let mut tx = Transaction::new_with_payer(&ixs, Some(&payer_pk));
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+
+    let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + extra_signers.len());
+    signers.push(&ctx.payer);
+    signers.extend_from_slice(extra_signers);
+
+    tx.sign(&signers, bh);
+
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .err()
+        .expect("tx must fail");
+
+    match err {
+        BanksClientError::TransactionError(TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(code),
+        )) => code,
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 async fn warp_until_ts(ctx: &mut ProgramTestContext, target_ts: i64) {
@@ -145,11 +176,15 @@ async fn token_balance(ctx: &mut ProgramTestContext, token_acc: &Pubkey) -> u64 
 }
 
 fn mk_ix(program_id: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> Instruction {
-    Instruction { program_id, accounts: metas, data }
+    Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    }
 }
 
 #[tokio::test]
-async fn claim_then_claim_again() {
+async fn claim_then_claim_again_pt() {
     let program_id = lockrion_issuance_v1_1::id();
 
     let pt = ProgramTest::new(
@@ -159,9 +194,20 @@ async fn claim_then_claim_again() {
     );
 
     let mut ctx = pt.start_with_context().await;
+
+    // ✅ STEP 1 — add platform keypair
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // ✅ STEP 2 — fund platform with lamports
+    let airdrop_ix = system_instruction::transfer(
+        &ctx.payer.pubkey(),
+        &platform.pubkey(),
+        5_000_000_000,
+    );
+    send_tx(&mut ctx, vec![airdrop_ix], &[]).await;
+
     let payer_pk = ctx.payer.pubkey();
 
-    // -------- params --------
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
     let now: i64 = (c.slot as i64) / 2;
 
@@ -171,11 +217,11 @@ async fn claim_then_claim_again() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    // -------- issuance PDA --------
+    // ✅ STEP 3 — issuance PDA derived from PLATFORM
     let (issuance_pda, _bump) =
-        pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
+        pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
+    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
 
-    // -------- mints --------
     let lock_mint = Keypair::new();
     let reward_mint = Keypair::new();
     let mint_auth = Keypair::new();
@@ -183,15 +229,18 @@ async fn claim_then_claim_again() {
     create_mint(&mut ctx, &lock_mint, &mint_auth.pubkey(), 0).await;
     create_mint(&mut ctx, &reward_mint, &mint_auth.pubkey(), 0).await;
 
-    // -------- token accounts --------
     let deposit_escrow = Keypair::new();
-    let reward_escrow  = Keypair::new();
+    let reward_escrow = Keypair::new();
 
-    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(),  &issuance_pda).await;
-    create_token_account(&mut ctx, &reward_escrow,  &reward_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
+    create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    // ✅ STEP 4 — issuer_reward owned by PLATFORM
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
+
+    let platform_treasury = Keypair::new();
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &payer_pk).await;
 
     let participant_lock = Keypair::new();
     create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &payer_pk).await;
@@ -199,7 +248,6 @@ async fn claim_then_claim_again() {
     let participant_reward = Keypair::new();
     create_token_account(&mut ctx, &participant_reward, &reward_mint.pubkey(), &payer_pk).await;
 
-    // mint balances
     mint_to(
         &mut ctx,
         &reward_mint.pubkey(),
@@ -218,57 +266,56 @@ async fn claim_then_claim_again() {
     )
     .await;
 
-    // -------- init_issuance --------
-    let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
-        .try_to_vec()
-        .unwrap();
-
     let init_ix = mk_ix(
         program_id,
-        init_data,
+        LockrionInstruction::InitIssuance {
+            reserve_total,
+            start_ts,
+            maturity_ts,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
-            AccountMeta::new(payer_pk, true),
+            // ✅ STEP 5 — init_issuance signer is PLATFORM
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
             AccountMeta::new_readonly(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(reward_escrow.pubkey(), false),
-            AccountMeta::new_readonly(payer_pk, false),
+            AccountMeta::new_readonly(platform_treasury.pubkey(), false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx(&mut ctx, vec![init_ix], &[]).await;
-
-    // -------- fund_reserve (до start_ts) --------
-    let fund_data = LockrionInstruction::FundReserve { amount: reserve_total as u64 }
-        .try_to_vec()
-        .unwrap();
+    send_tx(&mut ctx, vec![init_ix], &[&platform]).await;
 
     let fund_ix = mk_ix(
         program_id,
-        fund_data,
+        LockrionInstruction::FundReserve {
+            amount: reserve_total as u64,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            // ✅ STEP 6 — fund_reserve signer is PLATFORM
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx(&mut ctx, vec![fund_ix], &[&platform]).await;
 
-    // -------- deposit (ПОСЛЕ start_ts) --------
     warp_until_ts(&mut ctx, start_ts).await;
-
-    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
-
-    let dep_data = LockrionInstruction::Deposit { amount: deposit_amount }
-        .try_to_vec()
-        .unwrap();
 
     let dep_ix = mk_ix(
         program_id,
-        dep_data,
+        LockrionInstruction::Deposit {
+            amount: deposit_amount,
+        }
+        .try_to_vec()
+        .unwrap(),
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
@@ -281,7 +328,6 @@ async fn claim_then_claim_again() {
     );
     send_tx(&mut ctx, vec![dep_ix], &[]).await;
 
-    // -------- claim #1 (ПОСЛЕ maturity_ts) --------
     warp_until_ts(&mut ctx, maturity_ts).await;
 
     let reward_before_1 = token_balance(&mut ctx, &participant_reward.pubkey()).await;
@@ -308,7 +354,6 @@ async fn claim_then_claim_again() {
     assert!(reward_after_1 > reward_before_1, "first claim did not increase reward");
     assert!(escrow_after_1 < escrow_before_1, "escrow did not decrease after first claim");
 
-    // -------- claim #2 (MUST FAIL) --------
     let reward_before_2 = reward_after_1;
     let escrow_before_2 = escrow_after_1;
 
@@ -325,10 +370,9 @@ async fn claim_then_claim_again() {
         ],
     );
 
-    let res2 = try_tx(&mut ctx, vec![claim_ix_2], &[]).await;
-    assert!(res2.is_err(), "second claim unexpectedly succeeded");
+    let code = send_expect_custom(&mut ctx, vec![claim_ix_2], &[]).await;
+    assert_eq!(code, LockrionError::AlreadyClaimed as u32);
 
-    // No double transfer:
     let reward_after_2 = token_balance(&mut ctx, &participant_reward.pubkey()).await;
     let escrow_after_2 = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
 

@@ -7,16 +7,13 @@ use solana_program_test::*;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{read_keypair_file, Keypair, Signer},
     system_instruction, system_program,
     transaction::Transaction,
 };
 use spl_token::state::{Account as TokenAccount, Mint};
 
-use lockrion_issuance_v1_1::{
-    instruction::LockrionInstruction,
-    pda,
-};
+use lockrion_issuance_v1_1::{instruction::LockrionInstruction, pda};
 
 async fn send_tx_ok(ctx: &mut ProgramTestContext, ixs: Vec<Instruction>, extra_signers: &[&Keypair]) {
     let payer_pk = ctx.payer.pubkey();
@@ -59,14 +56,8 @@ async fn create_mint(ctx: &mut ProgramTestContext, mint_kp: &Keypair, mint_autho
         &spl_token::id(),
     );
 
-    let init = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
-        &mint_kp.pubkey(),
-        mint_authority,
-        None,
-        decimals,
-    )
-    .unwrap();
+    let init = spl_token::instruction::initialize_mint(&spl_token::id(), &mint_kp.pubkey(), mint_authority, None, decimals)
+        .unwrap();
 
     send_tx_ok(ctx, vec![create, init], &[mint_kp]).await;
 }
@@ -84,23 +75,13 @@ async fn create_token_account(ctx: &mut ProgramTestContext, acct_kp: &Keypair, m
         &spl_token::id(),
     );
 
-    let init =
-        spl_token::instruction::initialize_account(&spl_token::id(), &acct_kp.pubkey(), mint, owner).unwrap();
+    let init = spl_token::instruction::initialize_account(&spl_token::id(), &acct_kp.pubkey(), mint, owner).unwrap();
 
     send_tx_ok(ctx, vec![create, init], &[acct_kp]).await;
 }
 
 async fn mint_to(ctx: &mut ProgramTestContext, mint: &Pubkey, dst: &Pubkey, mint_authority: &Keypair, amount: u64) {
-    let ix = spl_token::instruction::mint_to(
-        &spl_token::id(),
-        mint,
-        dst,
-        &mint_authority.pubkey(),
-        &[],
-        amount,
-    )
-    .unwrap();
-
+    let ix = spl_token::instruction::mint_to(&spl_token::id(), mint, dst, &mint_authority.pubkey(), &[], amount).unwrap();
     send_tx_ok(ctx, vec![ix], &[mint_authority]).await;
 }
 
@@ -125,7 +106,15 @@ async fn sweep_happy_program_test() {
     );
 
     let mut ctx = pt.start_with_context().await;
-    let payer_pk = ctx.payer.pubkey();
+
+    // -------- PLATFORM --------
+    let platform = read_keypair_file("platform-authority.json").unwrap();
+
+    // дать platform лампорты
+    let airdrop_ix = system_instruction::transfer(&ctx.payer.pubkey(), &platform.pubkey(), 5_000_000_000);
+    send_tx_ok(&mut ctx, vec![airdrop_ix], &[]).await;
+
+    let participant_pk = ctx.payer.pubkey();
 
     // now matches feature test-clock: slot/2
     let c: solana_sdk::sysvar::clock::Clock = ctx.banks_client.get_sysvar().await.unwrap();
@@ -137,8 +126,11 @@ async fn sweep_happy_program_test() {
     let start_ts: i64 = now + 10;
     let maturity_ts: i64 = start_ts + 86_400;
 
-    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &payer_pk, start_ts, reserve_total);
-    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &payer_pk);
+    // issuance PDA от PLATFORM
+    let (issuance_pda, _bump) = pda::derive_issuance_pda(&program_id, &platform.pubkey(), start_ts, reserve_total);
+
+    // user PDA от PARTICIPANT
+    let (user_pda, _ub) = pda::derive_user_pda(&program_id, &issuance_pda, &participant_pk);
 
     // mints
     let lock_mint = Keypair::new();
@@ -147,31 +139,32 @@ async fn sweep_happy_program_test() {
     create_mint(&mut ctx, &lock_mint, &mint_auth.pubkey(), 0).await;
     create_mint(&mut ctx, &reward_mint, &mint_auth.pubkey(), 0).await;
 
-    // escrows
+    // escrows (authority = issuance_pda)
     let deposit_escrow = Keypair::new();
     let reward_escrow = Keypair::new();
     create_token_account(&mut ctx, &deposit_escrow, &lock_mint.pubkey(), &issuance_pda).await;
     create_token_account(&mut ctx, &reward_escrow, &reward_mint.pubkey(), &issuance_pda).await;
 
-    // issuer reward ATA (for funding) + participant accounts
+    // issuer reward account (owner = PLATFORM) for funding
     let issuer_reward = Keypair::new();
-    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &issuer_reward, &reward_mint.pubkey(), &platform.pubkey()).await;
 
+    // participant accounts
     let participant_lock = Keypair::new();
-    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &participant_lock, &lock_mint.pubkey(), &participant_pk).await;
 
     let participant_reward = Keypair::new();
-    create_token_account(&mut ctx, &participant_reward, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &participant_reward, &reward_mint.pubkey(), &participant_pk).await;
 
-    // platform treasury token account (MUST be reward_mint per sweep implementation)
+    // platform treasury token account (reward_mint)
     let platform_treasury = Keypair::new();
-    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &payer_pk).await;
+    create_token_account(&mut ctx, &platform_treasury, &reward_mint.pubkey(), &platform.pubkey()).await;
 
     // mint balances
     mint_to(&mut ctx, &reward_mint.pubkey(), &issuer_reward.pubkey(), &mint_auth, reserve_total as u64).await;
     mint_to(&mut ctx, &lock_mint.pubkey(), &participant_lock.pubkey(), &mint_auth, deposit_amount).await;
 
-    // init_issuance: platform_treasury passed as pubkey of token account (reward mint)
+    // init_issuance (signer = PLATFORM)
     let init_data = LockrionInstruction::InitIssuance { reserve_total, start_ts, maturity_ts }
         .try_to_vec()
         .unwrap();
@@ -180,7 +173,7 @@ async fn sweep_happy_program_test() {
         program_id,
         init_data,
         vec![
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new_readonly(lock_mint.pubkey(), false),
             AccountMeta::new_readonly(reward_mint.pubkey(), false),
@@ -190,9 +183,9 @@ async fn sweep_happy_program_test() {
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![init_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![init_ix], &[&platform]).await;
 
-    // fund_reserve before start_ts
+    // fund_reserve before start_ts (signer = PLATFORM)
     let fund_data = LockrionInstruction::FundReserve { amount: reserve_total as u64 }
         .try_to_vec()
         .unwrap();
@@ -202,20 +195,18 @@ async fn sweep_happy_program_test() {
         fund_data,
         vec![
             AccountMeta::new(issuance_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(platform.pubkey(), true),
             AccountMeta::new(issuer_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
     );
-    send_tx_ok(&mut ctx, vec![fund_ix], &[]).await;
+    send_tx_ok(&mut ctx, vec![fund_ix], &[&platform]).await;
 
-    // deposit after start_ts (to create participation)
+    // deposit after start_ts (participant signer = ctx.payer)
     warp_until_ts(&mut ctx, start_ts).await;
 
-    let dep_data = LockrionInstruction::Deposit { amount: deposit_amount }
-        .try_to_vec()
-        .unwrap();
+    let dep_data = LockrionInstruction::Deposit { amount: deposit_amount }.try_to_vec().unwrap();
 
     let dep_ix = mk_ix(
         program_id,
@@ -223,7 +214,7 @@ async fn sweep_happy_program_test() {
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_lock.pubkey(), false),
             AccountMeta::new(deposit_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -232,7 +223,7 @@ async fn sweep_happy_program_test() {
     );
     send_tx_ok(&mut ctx, vec![dep_ix], &[]).await;
 
-    // claim at maturity to reduce escrow balance, leaving remainder for sweep
+    // claim at maturity
     warp_until_ts(&mut ctx, maturity_ts).await;
 
     let before_claim = token_balance(&mut ctx, &participant_reward.pubkey()).await;
@@ -243,7 +234,7 @@ async fn sweep_happy_program_test() {
         vec![
             AccountMeta::new(issuance_pda, false),
             AccountMeta::new(user_pda, false),
-            AccountMeta::new(payer_pk, true),
+            AccountMeta::new(participant_pk, true),
             AccountMeta::new(participant_reward.pubkey(), false),
             AccountMeta::new(reward_escrow.pubkey(), false),
             AccountMeta::new_readonly(spl_token::id(), false),
@@ -254,15 +245,14 @@ async fn sweep_happy_program_test() {
     let after_claim = token_balance(&mut ctx, &participant_reward.pubkey()).await;
     assert!(after_claim > before_claim, "claim didn't pay");
 
-    // warp to after claim_window to allow sweep
-    // claim_window is 90 days in init_issuance implementation
+    // warp to after claim_window to allow sweep (claim_window = 90 days)
     let claim_window: i64 = 90 * 86_400;
     warp_until_ts(&mut ctx, maturity_ts + claim_window + 10).await;
 
     let treasury_before = token_balance(&mut ctx, &platform_treasury.pubkey()).await;
     let escrow_before = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
 
-    // sweep: transfer remaining escrow -> platform_treasury
+    // sweep: remaining escrow -> platform_treasury
     let sweep_ix = mk_ix(
         program_id,
         LockrionInstruction::Sweep.try_to_vec().unwrap(),
@@ -279,5 +269,9 @@ async fn sweep_happy_program_test() {
     let escrow_after = token_balance(&mut ctx, &reward_escrow.pubkey()).await;
 
     assert_eq!(escrow_after, 0, "escrow must be empty after sweep");
-    assert_eq!(treasury_after, treasury_before + escrow_before, "treasury must receive full remaining balance");
+    assert_eq!(
+        treasury_after,
+        treasury_before + escrow_before,
+        "treasury must receive full remaining balance"
+    );
 }

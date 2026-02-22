@@ -417,8 +417,6 @@ cargo test --features test-clock --test 028_arithmetic_overflow_rejected_pt -- -
 
 ---
 
----
-
 ### accumulator_unit.rs
 Status: PASS  
 Expected:
@@ -663,5 +661,3 @@ Expected:
 
 Run:
 cargo test --features test-clock --test 046_seed_endianness_mutation_invalid_pda_pt -- --nocapture
-
----

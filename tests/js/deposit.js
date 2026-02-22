@@ -1,7 +1,15 @@
-const {Connection,PublicKey,Keypair,Transaction,TransactionInstruction,sendAndConfirmTransaction} = require("@solana/web3.js");
+const {
+  Connection,
+  PublicKey,
+  Keypair,
+  Transaction,
+  TransactionInstruction,
+  sendAndConfirmTransaction
+} = require("@solana/web3.js");
+
 const fs = require("fs");
 
-const RPC="http://127.0.0.1:8899";
+const RPC = "http://127.0.0.1:8899";
 
 [
   "PROGRAM_ID",
@@ -22,38 +30,49 @@ const participantLockAta = new PublicKey(process.env.PARTICIPANT_LOCK_ATA);
 const depositEscrow = new PublicKey(process.env.DEPOSIT_ESCROW);
 const amount = BigInt(process.env.AMOUNT);
 
-const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("target/deploy/test-wallet.json","utf8"))));
+// PARTICIPANT = владелец participantLockAta
+const participant = Keypair.fromSecretKey(
+  Uint8Array.from(
+    JSON.parse(
+      fs.readFileSync("platform-authority.json","utf8")
+    )
+  )
+);
+
 const tokenProgram = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const systemProgram = new PublicKey("11111111111111111111111111111111");
 
 // User PDA = ["user", issuance_pda, participant]
-const seed1 = Buffer.from("user");
-const seed2 = issuancePda.toBuffer();
-const seed3 = payer.publicKey.toBuffer();
-const [userPda] = PublicKey.findProgramAddressSync([seed1, seed2, seed3], programId);
+const [userPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("user"),
+    issuancePda.toBuffer(),
+    participant.publicKey.toBuffer()
+  ],
+  programId
+);
 
 (async()=>{
   const c = new Connection(RPC,"confirmed");
 
-  // Borsh enum variant index:
-  // 0 InitIssuance, 1 FundReserve, 2 Deposit, ...
   const data = Buffer.alloc(1+8);
-  data.writeUInt8(2,0);                 // Deposit discriminant
+  data.writeUInt8(2,0); // Deposit discriminant
   data.writeBigUInt64LE(amount,1);
 
   const keys = [
-    {pubkey: issuancePda,         isSigner:false, isWritable:true},
-    {pubkey: userPda,            isSigner:false, isWritable:true},
-    {pubkey: payer.publicKey,    isSigner:true,  isWritable:true},  // payer for create_user_state
-    {pubkey: participantLockAta, isSigner:false, isWritable:true},
-    {pubkey: depositEscrow,      isSigner:false, isWritable:true},
-    {pubkey: tokenProgram,       isSigner:false, isWritable:false},
-    {pubkey: systemProgram,      isSigner:false, isWritable:false},
+    {pubkey: issuancePda,          isSigner:false, isWritable:true},
+    {pubkey: userPda,              isSigner:false, isWritable:true},
+    {pubkey: participant.publicKey,isSigner:true,  isWritable:false},
+    {pubkey: participantLockAta,   isSigner:false, isWritable:true},
+    {pubkey: depositEscrow,        isSigner:false, isWritable:true},
+    {pubkey: tokenProgram,         isSigner:false, isWritable:false},
+    {pubkey: systemProgram,        isSigner:false, isWritable:false},
   ];
 
   const ix = new TransactionInstruction({ programId, keys, data });
   const tx = new Transaction().add(ix);
-  const sig = await sendAndConfirmTransaction(c, tx, [payer]);
+
+  const sig = await sendAndConfirmTransaction(c, tx, [participant]);
 
   console.log("sig", sig);
   console.log("user_pda", userPda.toBase58());

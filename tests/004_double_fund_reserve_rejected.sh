@@ -4,7 +4,7 @@ set -euo pipefail
 
 RPC_URL="http://127.0.0.1:8899"
 DEPLOY_SCRIPT="./deploy_lockrion_gitbash.sh"
-PAYER_WALLET="target/deploy/test-wallet.json"
+PAYER_WALLET="platform-authority.json"
 FEE_PAYER="$PAYER_WALLET"
 
 die(){ echo "TEST FAIL: $*" 1>&2; exit 1; }
@@ -22,6 +22,7 @@ solana config set --url "$RPC_URL" >/dev/null
 solana config set --keypair "$PAYER_WALLET" >/dev/null
 
 OUT="$("$DEPLOY_SCRIPT" 2>&1)"
+solana config set --keypair "$PAYER_WALLET" >/dev/null
 PROGRAM_ID="$(printf "%s\n" "$OUT" | awk '/Program ID \(will be deployed to\):/ {getline; gsub(/\r/,""); print; exit}')"
 [ -n "${PROGRAM_ID:-}" ] || die "Could not parse Program ID"
 
